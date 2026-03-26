@@ -1,9 +1,12 @@
-# Data files
-data/GSE77975_RAW.tar
-data/raw/
-data/metadata/
+# Data (large, downloaded from GEO)
+data/
+*.tar
 
-# R
+# Generated outputs (large CSV files)
+output/features/*.csv
+output/results/*.csv
+
+# R (legacy)
 .Rhistory
 .Rdata
 .RData
@@ -30,11 +33,8 @@ desktop.ini
 .vscode/
 .idea/
 
-# Output
-*.csv
+# Other
 *.rds
 *.pkl
 *.joblib
-
-
-
+.claude/
