@@ -3,39 +3,47 @@
 ## Overview
 MA770 final project (Evan Dugas & Fred Choi). The central question: **Does cleaning up genomic noise with an HMM produce better features for predicting cancer stage (MGUS vs MM) than using raw copy number data directly?**
 
-Multi-dataset analysis across 2 Agilent CGH studies (196 samples: 96 MGUS + 100 MM). Custom 3-state HMM segmentation produces arm-level CNA features, compared against raw log2 ratio features for classification.
+Multi-dataset analysis across 6 studies (639 samples: 116 MGUS + 523 MM). Custom 3-state HMM segmentation on 1Mb-binned data produces arm-level CNA features, compared against raw log2 ratio features for classification. Genomic bin normalization enables cross-platform harmonization.
 
 ## Data
 
 ### Dataset Summary
 | Dataset | Platform | MGUS | MM | Excluded | Notes |
 |---------|----------|------|----|----------|-------|
-| GSE77975 | Agilent GPL11358 + 3 others | 90 | 33 | 13 normals | Primary dataset |
-| GSE33685 | Agilent GPL10152 | 6 | 67 | - | Japanese cohort |
-| **Total** | | **96** | **100** | **13** | |
+| GSE77975 | Agilent GPL11358 (1M) + 3 others | 90 | 33 | 13 normals | Primary dataset |
+| GSE33685 | Agilent GPL10152 (60K) | 6 | 67 | - | Japanese cohort |
+| GSE31339 | Affymetrix SNP 6.0 (1.85M) | 20 | 34 | 30 (SMM+normals) | Lopez-Corral et al. 2012 |
+| GSE26849 | Agilent 244K | 0 | 254 | - | MMRC reference collection |
+| GSE44745 | Agilent 244K | 0 | 63 | - | Malaysian multi-ethnic |
+| GSE29023 | Agilent 244K | 0 | 92 | - | Paired expression+CGH |
+| **Total** | | **116** | **523** | **43** | |
 
 ### Setup (from scratch)
 ```bash
-bash scripts/download_geo_data.sh           # Download + extract all data
-python scripts/sort_samples.py              # Sort into mgus/mm/excluded
-python python/01_process_all_datasets.py    # Parse -> HMM -> arm features -> merge
-python python/04_classification.py          # Classification + stat tests
-python python/05_deep_learning.py           # MLP comparison
-python python/06_analysis.py               # SHAP + cross-dataset + CNA heatmap
+bash pipeline/00_download.sh           # Download + extract all data
+python pipeline/01_sort_samples.py     # Sort into mgus/mm/excluded
+python pipeline/05_process.py          # Parse -> bin -> HMM -> arm features -> merge
+python pipeline/06_classify.py         # Classification + stat tests
+python pipeline/07_deep_learning.py    # MLP comparison
+python pipeline/08_analyze.py          # SHAP + cross-dataset + CNA heatmap
 ```
 
 ## Pipeline
 ```
 Per-dataset (independent):
-  Agilent .gz files -> parse -> clean -> pooled 3-state HMM -> probe states
+  Raw files (Agilent .gz / Affymetrix processed) -> parse -> clean
+  -> Map probes to 1Mb genomic bins (2,897 bins, hg19) -> median per bin
+  -> Per-sample centering -> pooled 3-state HMM on binned data
   -> arm-level CNA fractions + derived features (burden, segments, means)
 
-Merge (platform-agnostic):
-  209 features per sample -> single 196-row matrix
+Merge (platform-agnostic via binning):
+  209 arm-level features + 2,897 bin-level features per sample
+  -> single 639-row master matrix
 
 Classification:
   4 feature sets: HMM basic (82) vs HMM enhanced (209) vs Raw (82) vs Combined (291)
   Models: RF + LR + MLP with 5x10 repeated stratified CV
+  + Leave-one-dataset-out CV for cross-platform generalization
 ```
 
 ## HMM Details
@@ -119,15 +127,20 @@ Note: GSE77979 (33 MGUS, same platform) was investigated but is 100% overlapping
 - [ ] Phase 9: Report & presentation
 
 ## Scripts
+All scripts live in `pipeline/`. Run numbered scripts in order (02-04 are library modules).
+
 | File | Purpose |
 |------|---------|
-| `scripts/download_geo_data.sh` | Download all GEO datasets |
-| `scripts/sort_samples.py` | Sort samples by MGUS/MM/excluded label |
-| `python/hmm_core.py` | Shared HMM functions (fit, postprocess, pooled transmat) |
-| `python/01_process_all_datasets.py` | Full pipeline: parse -> HMM -> features -> merge |
-| `python/04_classification.py` | Classification (4 feature sets, confusion matrices, stat tests) |
-| `python/05_deep_learning.py` | MLP vs RF vs LR comparison |
-| `python/06_analysis.py` | SHAP, cross-dataset validation, CNA heatmap, ComBat batch correction |
+| `00_download.sh` | Download all 6 GEO datasets |
+| `01_sort_samples.py` | Sort samples by MGUS/MM/excluded label |
+| `02_genomic_bins.py` | 1Mb bin framework, probe-to-bin mapping, arm assignments |
+| `03_parsers.py` | Platform-specific parsers (Agilent, Affymetrix) |
+| `04_hmm_core.py` | Shared HMM functions (fit, postprocess, pooled transmat) |
+| `05_process.py` | Parse -> bin -> HMM -> arm features -> merge |
+| `06_classify.py` | Classification (4 feature sets, LODO CV, stat tests) |
+| `07_deep_learning.py` | MLP vs RF vs LR comparison |
+| `08_analyze.py` | SHAP, cross-dataset, CNA heatmap, ComBat, platform QC |
+| `09_process_cel.R` | Affymetrix CEL -> log2 ratio (R fallback, conditional) |
 
 ## Output Files
 ```
@@ -142,10 +155,20 @@ output/plots/
   08_shap_beeswarm.png            # SHAP beeswarm plot
   09_shap_bar.png                 # SHAP bar plot
   10_shap_waterfall.png           # SHAP waterfall (individual patients)
+  11_lodo_cv.png                  # Leave-one-dataset-out CV
+  12_platform_qc.png              # Bin coverage + noise by dataset
+
+output/features/
+  feature_matrix_arm_all.csv      # Arm-level features (master matrix)
+  feature_matrix_binned.csv       # Bin-level log2 ratios (2,897 bins)
+  feature_matrix_raw_arm.csv      # Raw arm mean+SD features
+  feature_matrix_combat.csv       # ComBat-corrected arm features
+  feature_matrix_binned_combat.csv # ComBat-corrected bin features
 
 output/results/
   classification_results.csv      # Main results table
   statistical_tests.csv           # p-values for pairwise comparisons
+  lodo_results.csv                # Leave-one-dataset-out results
   deep_learning_results.csv       # MLP comparison
   cross_dataset_results.csv       # Cross-dataset validation
 ```

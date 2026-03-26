@@ -42,7 +42,7 @@ def fit_hmm_chromosome(args, transmat=None):
     """
     chrom, log_ratios, starts, ends = args
 
-    if len(log_ratios) < 20:
+    if len(log_ratios) < 10:
         return None
 
     X = log_ratios.reshape(-1, 1)
@@ -116,7 +116,7 @@ def estimate_pooled_transmat(all_log_ratios):
     trans_counts = np.zeros((N_STATES, N_STATES))
 
     for chrom, lr in all_log_ratios.items():
-        if len(lr) < 20:
+        if len(lr) < 10:
             continue
 
         X = lr.reshape(-1, 1)

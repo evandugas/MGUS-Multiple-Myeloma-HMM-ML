@@ -1,14 +1,17 @@
-###############################################################################
-# Phase 4: ML Classification
-# Compares four feature sets for MGUS/MM classification:
-#   1. HMM arm fractions only (baseline)
-#   2. HMM enhanced (arm fractions + derived: burden, segments, means)
-#   3. Raw LogRatio arm-level (mean + SD)
-#   4. HMM + Raw combined
-# Includes: confusion matrices, per-class metrics, statistical significance.
-###############################################################################
+#!/usr/bin/env python3
+"""Phase 4: ML Classification
+
+Compares four feature sets for MGUS/MM classification:
+  1. HMM arm fractions only (baseline)
+  2. HMM enhanced (arm fractions + derived: burden, segments, means)
+  3. Raw bin-level arm stats (mean + SD per arm from 1Mb bins)
+  4. HMM + Raw combined
+Includes: confusion matrices, per-class metrics, statistical significance,
+          leave-one-dataset-out cross-validation.
+"""
 
 import os
+import sys
 import warnings
 warnings.filterwarnings("ignore")
 import numpy as np
@@ -25,7 +28,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-BASE_DIR = os.path.join("C:", os.sep, "Users", "Evan", "MGUS-Multiple-Myeloma-HMM-ML")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(BASE_DIR, "pipeline"))
+import importlib
+_gb = importlib.import_module("02_genomic_bins")
+CENTROMERES = _gb.CENTROMERES
+CHROMOSOMES = _gb.CHROMOSOMES
+BIN_TABLE = _gb.BIN_TABLE
+bins_to_arm_mapping = _gb.bins_to_arm_mapping
+
 FEAT_DIR = os.path.join(BASE_DIR, "output", "features")
 PLOT_DIR = os.path.join(BASE_DIR, "output", "plots")
 RESULTS_DIR = os.path.join(BASE_DIR, "output", "results")
@@ -36,23 +47,10 @@ N_SPLITS = 5
 N_REPEATS = 10
 RANDOM_STATE = 42
 
-CENTROMERES = {
-    "chr1": 125e6, "chr2": 93.3e6, "chr3": 91e6, "chr4": 50.4e6,
-    "chr5": 48.4e6, "chr6": 61e6, "chr7": 59.9e6, "chr8": 45.6e6,
-    "chr9": 49e6, "chr10": 40.2e6, "chr11": 53.7e6, "chr12": 35.8e6,
-    "chr13": 17.9e6, "chr14": 17.6e6, "chr15": 19e6, "chr16": 36.6e6,
-    "chr17": 22.2e6, "chr18": 18.2e6, "chr19": 26.5e6, "chr20": 27.5e6,
-    "chr21": 13.2e6, "chr22": 14.7e6,
-}
-CHROMOSOMES = [f"chr{i}" for i in range(1, 23)]
 
-
-def run_cv(X, y, feature_names, dataset_name):
-    """Run repeated stratified k-fold CV with RF and LR."""
-    cv = RepeatedStratifiedKFold(n_splits=N_SPLITS, n_repeats=N_REPEATS,
-                                  random_state=RANDOM_STATE)
-
-    models = {
+def make_models():
+    """Create fresh model instances."""
+    return {
         "Random Forest": RandomForestClassifier(
             n_estimators=500, max_depth=5, min_samples_leaf=3,
             class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1),
@@ -61,6 +59,13 @@ def run_cv(X, y, feature_names, dataset_name):
             class_weight="balanced", random_state=RANDOM_STATE),
     }
 
+
+def run_cv(X, y, feature_names, dataset_name):
+    """Run repeated stratified k-fold CV with RF and LR."""
+    cv = RepeatedStratifiedKFold(n_splits=N_SPLITS, n_repeats=N_REPEATS,
+                                  random_state=RANDOM_STATE)
+
+    models = make_models()
     results = {name: {"auc": [], "f1": [], "bal_acc": [],
                        "y_true_all": [], "y_prob_all": [], "y_pred_all": [],
                        "importances": []}
@@ -112,9 +117,8 @@ def run_cv(X, y, feature_names, dataset_name):
             "Sensitivity": sensitivity, "Specificity": specificity,
         }
         summary_rows.append(row)
-        print(f"  {name}: AUC={row['AUC_mean']:.3f}±{row['AUC_std']:.3f}  "
-              f"F1={row['F1_mean']:.3f}±{row['F1_std']:.3f}  "
-              f"BalAcc={row['BalAcc_mean']:.3f}±{row['BalAcc_std']:.3f}  "
+        print(f"  {name}: AUC={row['AUC_mean']:.3f}+/-{row['AUC_std']:.3f}  "
+              f"F1={row['F1_mean']:.3f}  BalAcc={row['BalAcc_mean']:.3f}  "
               f"Sens={sensitivity:.3f}  Spec={specificity:.3f}")
 
     for name in models:
@@ -122,6 +126,69 @@ def run_cv(X, y, feature_names, dataset_name):
         results[name]["mean_importance"] = imps.mean(axis=0)
 
     return results, summary_rows
+
+
+def run_lodo_cv(X, y, datasets, feature_names, feat_set_name):
+    """Leave-one-dataset-out cross-validation.
+
+    Train on all datasets except one, test on the held-out dataset.
+    Returns per-dataset results and summary rows.
+    """
+    unique_ds = sorted(datasets.unique())
+    if len(unique_ds) < 2:
+        print("  LODO requires >= 2 datasets, skipping")
+        return [], []
+
+    models = make_models()
+    all_rows = []
+
+    print(f"\n  === Leave-One-Dataset-Out: {feat_set_name} ===")
+
+    for test_ds in unique_ds:
+        test_mask = datasets == test_ds
+        train_mask = ~test_mask
+
+        X_tr, y_tr = X[train_mask], y[train_mask]
+        X_te, y_te = X[test_mask], y[test_mask]
+
+        if len(np.unique(y_te)) < 2:
+            # Test set has only one class — can't compute AUC
+            n_mgus = (y_te == 0).sum()
+            n_mm = (y_te == 1).sum()
+            print(f"  {test_ds}: {n_mgus} MGUS + {n_mm} MM — skipped (single class)")
+            continue
+
+        scaler = StandardScaler()
+        X_tr_s = scaler.fit_transform(X_tr)
+        X_te_s = scaler.transform(X_te)
+
+        for name, model in models.items():
+            model_fresh = make_models()[name]
+            if "Logistic" in name:
+                model_fresh.fit(X_tr_s, y_tr)
+                y_prob = model_fresh.predict_proba(X_te_s)[:, 1]
+            else:
+                model_fresh.fit(X_tr, y_tr)
+                y_prob = model_fresh.predict_proba(X_te)[:, 1]
+
+            y_pred = (y_prob >= 0.5).astype(int)
+            auc = roc_auc_score(y_te, y_prob)
+            f1 = f1_score(y_te, y_pred, zero_division=0)
+            ba = balanced_accuracy_score(y_te, y_pred)
+
+            row = {
+                "test_dataset": test_ds,
+                "model": name,
+                "features": feat_set_name,
+                "n_train": len(y_tr),
+                "n_test": len(y_te),
+                "AUC": auc, "F1": f1, "BalAcc": ba,
+            }
+            all_rows.append(row)
+            print(f"  Test={test_ds} ({len(y_te)} samples), {name}: "
+                  f"AUC={auc:.3f}  F1={f1:.3f}  BalAcc={ba:.3f}")
+
+    return all_rows
 
 
 def statistical_tests(all_results):
@@ -134,7 +201,7 @@ def statistical_tests(all_results):
     model = "Random Forest"
     rows = []
 
-    print("\n  === Statistical Significance (RF, paired across 50 CV folds) ===")
+    print("\n  === Statistical Significance (RF, paired across CV folds) ===")
     for ds_a, ds_b in comparisons:
         if ds_a not in all_results or ds_b not in all_results:
             continue
@@ -151,7 +218,8 @@ def statistical_tests(all_results):
                 "t_statistic": t_stat, "t_pvalue": t_pval,
                 "wilcoxon_statistic": w_stat, "wilcoxon_pvalue": w_pval,
             })
-            sig = "***" if t_pval < 0.001 else "**" if t_pval < 0.01 else "*" if t_pval < 0.05 else "ns"
+            sig = "***" if t_pval < 0.001 else "**" if t_pval < 0.01 \
+                else "*" if t_pval < 0.05 else "ns"
             print(f"  {ds_a} vs {ds_b} [{metric.upper()}]: "
                   f"diff={diff:+.4f}  p={t_pval:.4f} {sig}")
 
@@ -173,10 +241,9 @@ def plot_confusion_matrices(all_results, dataset_names):
         y_true = np.array(r["y_true_all"])
         y_pred = np.array(r["y_pred_all"])
         cm = confusion_matrix(y_true, y_pred)
-        # Normalize by row (true label)
         cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
 
-        im = ax.imshow(cm_norm, cmap="Blues", vmin=0, vmax=1)
+        ax.imshow(cm_norm, cmap="Blues", vmin=0, vmax=1)
         ax.set_xticks([0, 1])
         ax.set_yticks([0, 1])
         ax.set_xticklabels(["MGUS", "MM"], fontsize=10)
@@ -184,11 +251,7 @@ def plot_confusion_matrices(all_results, dataset_names):
         ax.set_xlabel("Predicted", fontsize=11)
         ax.set_ylabel("True", fontsize=11)
 
-        short = ds_name.split(" ")[0]
-        if "Enhanced" in ds_name:
-            short = "HMM+"
-        elif "Combined" in ds_name:
-            short = "Combined"
+        short = _short_name(ds_name)
         ax.set_title(f"{short} RF", fontsize=12)
 
         for i in range(2):
@@ -197,25 +260,60 @@ def plot_confusion_matrices(all_results, dataset_names):
                 ax.text(j, i, f"{cm[i,j]}\n({cm_norm[i,j]:.1%})",
                         ha="center", va="center", color=color, fontsize=10)
 
-    plt.suptitle("Confusion Matrices (RF, pooled across 50 CV folds)", fontsize=13)
+    plt.suptitle("Confusion Matrices (RF, pooled across CV folds)", fontsize=13)
     plt.tight_layout()
     plt.savefig(os.path.join(PLOT_DIR, "05_confusion_matrices.png"), dpi=150,
                 bbox_inches="tight")
     plt.close()
 
 
-def build_raw_arm_features(merged_df):
-    """Build raw LogRatio arm-level features (mean + SD per arm) from the
-    original probe data for each dataset's samples."""
-    import gzip
+def build_raw_arm_features(merged_df, bin_matrix=None):
+    """Build raw arm-level features (mean + SD per arm).
 
+    If bin_matrix is provided, computes from bin-level log2 ratios
+    (platform-agnostic). Otherwise falls back to re-parsing raw files.
+    """
+    arm_map = bins_to_arm_mapping()
+    all_arms = sorted(set(arm_map.values()))
+
+    if bin_matrix is not None:
+        # Platform-agnostic: compute from bin-level data
+        rows = []
+        for sample_id in merged_df.index:
+            if sample_id not in bin_matrix.index:
+                continue
+            row = {"sample_id": sample_id, "label": merged_df.loc[sample_id, "label"]}
+            bin_vals = bin_matrix.loc[sample_id]
+
+            for arm_id in all_arms:
+                arm_bins = [str(idx) for idx, arm in arm_map.items() if arm == arm_id]
+                arm_cols = [c for c in arm_bins if c in bin_vals.index]
+                if arm_cols:
+                    vals = bin_vals[arm_cols].values.astype(float)
+                    vals = vals[vals != 0]  # skip empty bins
+                    if len(vals) > 0:
+                        row[f"mean_{arm_id}"] = float(np.mean(vals))
+                        row[f"sd_{arm_id}"] = float(np.std(vals)) if len(vals) > 1 else 0.0
+                    else:
+                        row[f"mean_{arm_id}"] = 0.0
+                        row[f"sd_{arm_id}"] = 0.0
+                else:
+                    row[f"mean_{arm_id}"] = 0.0
+                    row[f"sd_{arm_id}"] = 0.0
+            rows.append(row)
+
+        result = pd.DataFrame(rows).set_index("sample_id")
+        return result
+
+    # Fallback: re-parse Agilent raw files (only works for Agilent datasets)
+    import gzip
     sample_ids = merged_df.index.tolist()
     labels = dict(zip(merged_df.index, merged_df["label"]))
-    datasets = dict(zip(merged_df.index, merged_df["dataset"]))
+    datasets_col = dict(zip(merged_df.index, merged_df["dataset"]))
 
     ds_samples = {}
     for sid in sample_ids:
-        ds = datasets[sid]
+        ds = datasets_col[sid]
         if ds not in ds_samples:
             ds_samples[ds] = []
         ds_samples[ds].append(sid)
@@ -238,6 +336,7 @@ def build_raw_arm_features(merged_df):
                 if gsm_id not in sid_set:
                     continue
 
+                # Only parse Agilent files (have FEATURES header)
                 filepath = os.path.join(dir_path, filename)
                 try:
                     with gzip.open(filepath, "rt", errors="replace") as f:
@@ -285,11 +384,11 @@ def build_raw_arm_features(merged_df):
 
         print(f"  Parsed raw LogRatios for {ds_name}")
 
-    all_arms = sorted(set(a for sid in arm_stats for a in arm_stats[sid]))
+    all_arms_found = sorted(set(a for sid in arm_stats for a in arm_stats[sid]))
     rows = []
     for sid in sample_ids:
         row = {"sample_id": sid, "label": labels[sid]}
-        for arm_id in all_arms:
+        for arm_id in all_arms_found:
             s_val, sq, n = arm_stats[sid].get(arm_id, [0, 0, 0])
             mean = s_val / n if n > 0 else 0
             var = (sq / n - mean ** 2) if n > 1 else 0
@@ -301,16 +400,38 @@ def build_raw_arm_features(merged_df):
     return result
 
 
+def _short_name(ds_name):
+    if "Enhanced" in ds_name:
+        return "HMM+"
+    elif "Combined" in ds_name:
+        return "Combined"
+    elif "Raw" in ds_name:
+        return "Raw"
+    return "HMM"
+
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Classification: HMM vs Raw Features (196 samples)")
+    print("  Classification: HMM vs Raw Features")
     print("=" * 60)
 
     # Load merged HMM features
-    merged = pd.read_csv(os.path.join(FEAT_DIR, "feature_matrix_arm_all.csv"), index_col=0)
+    merged = pd.read_csv(os.path.join(FEAT_DIR, "feature_matrix_arm_all.csv"),
+                          index_col=0)
     merged = merged[merged["label"].isin(["MGUS", "MM"])]
 
     y = (merged["label"] == "MM").astype(int).values
+    ds_labels = merged["dataset"]
+
+    # Load bin-level features for raw arm computation
+    bin_path = os.path.join(FEAT_DIR, "feature_matrix_binned.csv")
+    bin_matrix = None
+    if os.path.exists(bin_path):
+        bin_matrix = pd.read_csv(bin_path, index_col=0)
+        # Drop metadata columns
+        meta = [c for c in ["label", "dataset"] if c in bin_matrix.columns]
+        if meta:
+            bin_matrix = bin_matrix.drop(columns=meta)
 
     # Separate feature sets
     meta_cols = ["label", "dataset"]
@@ -324,25 +445,31 @@ if __name__ == "__main__":
     X_basic = merged[basic_cols].fillna(0).values
     X_enhanced = merged[enhanced_cols].fillna(0).values
 
-    print(f"Loaded: {(y==0).sum()} MGUS + {(y==1).sum()} MM = {len(y)} samples")
+    n_mgus = (y == 0).sum()
+    n_mm = (y == 1).sum()
+    n_datasets = ds_labels.nunique()
+    print(f"Loaded: {n_mgus} MGUS + {n_mm} MM = {len(y)} samples "
+          f"from {n_datasets} datasets")
     print(f"HMM basic features: {X_basic.shape[1]}")
     print(f"HMM enhanced features: {X_enhanced.shape[1]}")
 
-    # Build raw features
-    print("\nBuilding raw LogRatio arm features...")
-    raw_df = build_raw_arm_features(merged)
+    # Build raw arm features (platform-agnostic from bins)
+    print("\nBuilding raw arm features from bin-level data...")
+    raw_df = build_raw_arm_features(merged, bin_matrix=bin_matrix)
     raw_df.to_csv(os.path.join(FEAT_DIR, "feature_matrix_raw_arm.csv"))
     X_raw = raw_df.drop(columns=["label"]).fillna(0).values
     raw_feat_names = raw_df.drop(columns=["label"]).columns.tolist()
     print(f"Raw features: {X_raw.shape[1]}")
 
-    # Enhancement 7: Combined HMM + Raw
+    # Combined
     X_combined = np.hstack([X_enhanced, X_raw])
     combined_feat_names = enhanced_cols + raw_feat_names
     print(f"Combined features: {X_combined.shape[1]}")
 
-    # Run CV on all four feature sets
-    datasets = [
+    # =========================================================================
+    # Standard repeated stratified CV
+    # =========================================================================
+    feature_sets = [
         ("HMM Arm Fractions", X_basic, basic_cols),
         ("HMM Enhanced", X_enhanced, enhanced_cols),
         ("Raw Arm (mean+SD)", X_raw, raw_feat_names),
@@ -352,15 +479,15 @@ if __name__ == "__main__":
     all_results = {}
     all_summaries = []
 
-    for name, X, feat_names in datasets:
+    for name, X, feat_names in feature_sets:
         print(f"\nRunning CV: {name} ({X.shape[1]} features)...")
         results, summaries = run_cv(X, y, feat_names, name)
         all_results[name] = results
         all_summaries.extend(summaries)
 
-    # Save results
     summary_df = pd.DataFrame(all_summaries)
-    summary_df.to_csv(os.path.join(RESULTS_DIR, "classification_results.csv"), index=False)
+    summary_df.to_csv(os.path.join(RESULTS_DIR, "classification_results.csv"),
+                       index=False)
 
     print("\n" + "=" * 60)
     print("  RESULTS SUMMARY")
@@ -369,39 +496,51 @@ if __name__ == "__main__":
                        "F1_mean", "BalAcc_mean", "Sensitivity",
                        "Specificity"]].to_string(index=False))
 
-    # Enhancement 6: Statistical significance
+    # Statistical significance
     stat_df = statistical_tests(all_results)
 
-    # ---- Plots ---------------------------------------------------------------
+    # =========================================================================
+    # Leave-one-dataset-out CV
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("  LEAVE-ONE-DATASET-OUT CV")
+    print("=" * 60)
 
+    lodo_rows = []
+    for name, X, feat_names in feature_sets:
+        rows = run_lodo_cv(X, y, ds_labels, feat_names, name)
+        lodo_rows.extend(rows)
+
+    if lodo_rows:
+        lodo_df = pd.DataFrame(lodo_rows)
+        lodo_df.to_csv(os.path.join(RESULTS_DIR, "lodo_results.csv"), index=False)
+        print(f"\n  LODO results saved to {RESULTS_DIR}/lodo_results.csv")
+
+    # =========================================================================
+    # Plots
+    # =========================================================================
     print("\nGenerating plots...")
     dataset_names = summary_df["dataset"].unique()
     model_names = summary_df["model"].unique()
-    x = np.arange(len(dataset_names))
+    x_pos = np.arange(len(dataset_names))
     width = 0.35
-    colors = ["steelblue", "coral"]
-    short_labels = []
-    for d in dataset_names:
-        if "Enhanced" in d:
-            short_labels.append("HMM+")
-        elif "Combined" in d:
-            short_labels.append("Combined")
-        elif "Raw" in d:
-            short_labels.append("Raw")
-        else:
-            short_labels.append("HMM")
+    bar_colors = ["steelblue", "coral"]
+    short_labels = [_short_name(d) for d in dataset_names]
 
-    # Plot 1: AUC comparison bar chart
+    # Plot 1: AUC comparison
     fig, ax = plt.subplots(figsize=(13, 6))
     for i, model in enumerate(model_names):
         subset = summary_df[summary_df["model"] == model]
-        means = [subset[subset["dataset"] == d]["AUC_mean"].values[0] for d in dataset_names]
-        stds = [subset[subset["dataset"] == d]["AUC_std"].values[0] for d in dataset_names]
-        ax.bar(x + i * width, means, width, yerr=stds, label=model,
-               capsize=4, alpha=0.85, color=colors[i])
+        means = [subset[subset["dataset"] == d]["AUC_mean"].values[0]
+                 for d in dataset_names]
+        stds = [subset[subset["dataset"] == d]["AUC_std"].values[0]
+                for d in dataset_names]
+        ax.bar(x_pos + i * width, means, width, yerr=stds, label=model,
+               capsize=4, alpha=0.85, color=bar_colors[i])
     ax.set_ylabel("AUC-ROC", fontsize=12)
-    ax.set_title("Classification: All Feature Sets (196 samples)", fontsize=13)
-    ax.set_xticks(x + width / 2)
+    ax.set_title(f"Classification: All Feature Sets ({len(y)} samples, "
+                 f"{n_datasets} datasets)", fontsize=13)
+    ax.set_xticks(x_pos + width / 2)
     ax.set_xticklabels(short_labels, fontsize=10)
     ax.legend(fontsize=10)
     ax.set_ylim(0.5, 1.0)
@@ -429,11 +568,7 @@ if __name__ == "__main__":
         y_prob = np.array(r["y_prob_all"])
         fpr, tpr, _ = roc_curve(y_true, y_prob)
         auc = roc_auc_score(y_true, y_prob)
-        label_short = ds_name.split(" ")[0]
-        if "Enhanced" in ds_name:
-            label_short = "HMM+"
-        elif "Combined" in ds_name:
-            label_short = "Comb"
+        label_short = _short_name(ds_name)
         model_short = "RF" if "Random" in model_name else "LR"
         ax.plot(fpr, tpr, color=color, linewidth=2, linestyle=ls,
                 label=f"{label_short} {model_short} (AUC={auc:.3f})")
@@ -459,8 +594,7 @@ if __name__ == "__main__":
             return "steelblue"
         elif name.startswith("amp_") or name.startswith("seg_mean_amp_"):
             return "firebrick"
-        else:
-            return "goldenrod"
+        return "goldenrod"
 
     colors_bar = [feature_color(n) for n in top_names]
     ax.barh(range(len(top_names)), top_vals, color=colors_bar, alpha=0.85)
@@ -471,7 +605,7 @@ if __name__ == "__main__":
     legend_elements = [
         Line2D([0], [0], color="steelblue", lw=8, label="Deletion"),
         Line2D([0], [0], color="firebrick", lw=8, label="Amplification"),
-        Line2D([0], [0], color="goldenrod", lw=8, label="Derived (burden/segments)"),
+        Line2D([0], [0], color="goldenrod", lw=8, label="Derived"),
     ]
     ax.legend(handles=legend_elements, loc="lower right", fontsize=10)
     plt.tight_layout()
@@ -487,25 +621,59 @@ if __name__ == "__main__":
     for ax, (mean_col, std_col, title) in zip(axes, metrics):
         for i, model in enumerate(model_names):
             subset = summary_df[summary_df["model"] == model]
-            means = [subset[subset["dataset"] == d][mean_col].values[0] for d in dataset_names]
-            stds = [subset[subset["dataset"] == d][std_col].values[0] for d in dataset_names]
-            ax.bar(x + i * width, means, width, yerr=stds, label=model,
-                   capsize=4, alpha=0.85, color=colors[i])
+            means = [subset[subset["dataset"] == d][mean_col].values[0]
+                     for d in dataset_names]
+            stds = [subset[subset["dataset"] == d][std_col].values[0]
+                    for d in dataset_names]
+            ax.bar(x_pos + i * width, means, width, yerr=stds, label=model,
+                   capsize=4, alpha=0.85, color=bar_colors[i])
         ax.set_title(title, fontsize=12)
-        ax.set_xticks(x + width / 2)
+        ax.set_xticks(x_pos + width / 2)
         ax.set_xticklabels(short_labels, fontsize=9)
         ax.set_ylim(0, 1)
         ax.axhline(0.5, color="gray", linestyle="--", linewidth=0.5)
         if ax == axes[0]:
             ax.legend(fontsize=8)
 
-    plt.suptitle("All Metrics: 4 Feature Sets (196 samples)", fontsize=13, y=1.02)
+    plt.suptitle(f"All Metrics: 4 Feature Sets ({len(y)} samples)", fontsize=13,
+                 y=1.02)
     plt.tight_layout()
-    plt.savefig(os.path.join(PLOT_DIR, "04_all_metrics.png"), dpi=150, bbox_inches="tight")
+    plt.savefig(os.path.join(PLOT_DIR, "04_all_metrics.png"), dpi=150,
+                bbox_inches="tight")
     plt.close()
 
     # Plot 5: Confusion matrices
     plot_confusion_matrices(all_results, dataset_names)
+
+    # Plot 6: LODO results
+    if lodo_rows:
+        lodo_df = pd.DataFrame(lodo_rows)
+        fig, ax = plt.subplots(figsize=(14, 6))
+        feat_sets = lodo_df["features"].unique()
+        test_datasets = lodo_df["test_dataset"].unique()
+        x_lodo = np.arange(len(test_datasets))
+        w = 0.8 / len(feat_sets)
+
+        for i, fs in enumerate(feat_sets):
+            fs_data = lodo_df[(lodo_df["features"] == fs) &
+                              (lodo_df["model"] == "Random Forest")]
+            aucs = []
+            for td in test_datasets:
+                row = fs_data[fs_data["test_dataset"] == td]
+                aucs.append(row["AUC"].values[0] if len(row) > 0 else 0)
+            ax.bar(x_lodo + i * w, aucs, w, label=_short_name(fs), alpha=0.85)
+
+        ax.set_ylabel("AUC-ROC", fontsize=12)
+        ax.set_title("Leave-One-Dataset-Out CV (RF)", fontsize=13)
+        ax.set_xticks(x_lodo + w * len(feat_sets) / 2)
+        ax.set_xticklabels(test_datasets, fontsize=9, rotation=30, ha="right")
+        ax.legend(fontsize=9)
+        ax.set_ylim(0, 1)
+        ax.axhline(0.5, color="gray", linestyle="--", linewidth=0.8)
+        plt.tight_layout()
+        plt.savefig(os.path.join(PLOT_DIR, "11_lodo_cv.png"), dpi=150,
+                    bbox_inches="tight")
+        plt.close()
 
     print(f"\nPlots saved to {PLOT_DIR}")
     print(f"Results saved to {RESULTS_DIR}")

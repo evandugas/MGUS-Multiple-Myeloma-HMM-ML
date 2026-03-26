@@ -19,7 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-BASE_DIR = os.path.join("C:", os.sep, "Users", "Evan", "MGUS-Multiple-Myeloma-HMM-ML")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FEAT_DIR = os.path.join(BASE_DIR, "output", "features")
 PLOT_DIR = os.path.join(BASE_DIR, "output", "plots")
 RESULTS_DIR = os.path.join(BASE_DIR, "output", "results")
@@ -93,7 +93,7 @@ def run_dl_cv(X, y, feature_set_name):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Deep Learning: MLP vs RF vs LR (196 samples)")
+    print("  Deep Learning: MLP vs RF vs LR")
     print("=" * 60)
 
     # Load features
@@ -181,7 +181,7 @@ if __name__ == "__main__":
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
                     f"{m:.3f}", ha="center", fontsize=9)
 
-    plt.suptitle("MLP vs RF vs LR on HMM Enhanced Features (196 samples)",
+    plt.suptitle(f"MLP vs RF vs LR on HMM Enhanced Features ({len(y)} samples)",
                  fontsize=13, y=1.02)
     plt.tight_layout()
     plt.savefig(os.path.join(PLOT_DIR, "07_dl_comparison.png"), dpi=150,
