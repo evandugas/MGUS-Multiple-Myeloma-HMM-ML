@@ -33,6 +33,14 @@ desktop.ini
 .vscode/
 .idea/
 
+# Nextflow (not used)
+.nextflow/
+.nextflow.log*
+work/
+nextflow
+nextflow.config
+main.nf
+
 # Other
 *.rds
 *.pkl

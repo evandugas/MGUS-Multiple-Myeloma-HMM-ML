@@ -68,31 +68,11 @@ download_dataset "GSE33685" "$DATA_DIR/GSE33685" \
     "67 MM + 6 MGUS, Agilent GPL10152" \
     "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE33nnn/GSE33685/matrix/GSE33685_series_matrix.txt.gz"
 
-# GSE31339: Affymetrix SNP 6.0 (20 MGUS + 20 SMM + 34 MM + 10 normals)
-download_dataset "GSE31339" "$DATA_DIR/GSE31339" \
-    "20 MGUS + 34 MM, Affymetrix SNP 6.0" \
-    "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE31nnn/GSE31339/matrix/GSE31339_series_matrix.txt.gz"
-
-# GSE26849: MMRC reference collection (Agilent 244K)
-download_dataset "GSE26849" "$DATA_DIR/GSE26849" \
-    "254 MM, Agilent 244K" \
-    "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE26nnn/GSE26849/matrix/GSE26849_series_matrix.txt.gz"
-
-# GSE44745: Malaysian multi-ethnic cohort (Agilent 244K)
-download_dataset "GSE44745" "$DATA_DIR/GSE44745" \
-    "63 MM, Agilent 244K" \
-    "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE44nnn/GSE44745/matrix/GSE44745_series_matrix.txt.gz"
-
-# GSE29023: Paired expression+CGH (Agilent 244K)
-download_dataset "GSE29023" "$DATA_DIR/GSE29023" \
-    "92 MM, Agilent 244K" \
-    "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE29nnn/GSE29023/matrix/GSE29023_series_matrix.txt.gz"
-
 echo ""
 echo "================================================"
 echo " Summary"
 echo "================================================"
-for ds in GSE77975 GSE33685 GSE31339 GSE26849 GSE44745 GSE29023; do
+for ds in GSE77975 GSE33685; do
     dir="$DATA_DIR/$ds"
     if [ -f "$dir/${ds}_RAW.tar" ]; then
         size=$(du -sh "$dir/${ds}_RAW.tar" | cut -f1)

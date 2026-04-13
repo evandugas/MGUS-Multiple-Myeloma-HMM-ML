@@ -40,7 +40,7 @@ def parse_series_matrix(matrix_path):
 
 
 # ============================================================================
-# Label assignment functions (one per dataset)
+# Label assignment functions
 # ============================================================================
 
 def assign_labels_gse77975(matrix_path):
@@ -91,59 +91,6 @@ def assign_labels_gse33685(matrix_path):
         else:
             labels[gsm] = "excluded"
     return labels
-
-
-def assign_labels_gse31339(matrix_path):
-    """GSE31339: Affymetrix SNP 6.0. Keep MGUS and MM, exclude SMM and normals.
-
-    Labels from sample characteristics (disease state field).
-    """
-    fields = parse_series_matrix(matrix_path)
-    gsm_ids = fields["!Sample_geo_accession"]
-    titles = fields.get("!Sample_title", [""] * len(gsm_ids))
-    all_chars = fields.get("!Sample_characteristics_ch1_all",
-                           fields.get("!Sample_characteristics_ch1", [""] * len(gsm_ids)))
-
-    labels = {}
-    for gsm, title, chars in zip(gsm_ids, titles, all_chars):
-        text = (title + " " + chars).upper()
-
-        if "NORMAL" in text or "CONTROL" in text or "HEALTHY" in text:
-            labels[gsm] = "excluded"
-        elif "SMOLDERING" in text or "SMM" in text:
-            labels[gsm] = "excluded"
-        elif "MULTIPLE MYELOMA" in text or "MYELOMA" in text or text.startswith("MM"):
-            labels[gsm] = "MM"
-        elif "MGUS" in text or "MONOCLONAL GAMMOPATHY" in text:
-            labels[gsm] = "MGUS"
-        else:
-            labels[gsm] = "excluded"
-    return labels
-
-
-def assign_labels_gse26849(matrix_path):
-    """GSE26849: MMRC reference collection. All MM."""
-    fields = parse_series_matrix(matrix_path)
-    gsm_ids = fields["!Sample_geo_accession"]
-    return {gsm: "MM" for gsm in gsm_ids}
-
-
-def assign_labels_gse44745(matrix_path):
-    """GSE44745: Malaysian multi-ethnic cohort. All MM."""
-    fields = parse_series_matrix(matrix_path)
-    gsm_ids = fields["!Sample_geo_accession"]
-    return {gsm: "MM" for gsm in gsm_ids}
-
-
-def assign_labels_gse29023(matrix_path):
-    """GSE29023: Paired expression+CGH. Only keep CGH samples (MM).
-
-    This dataset has both expression (GPL570) and CGH (GPL4091) arrays.
-    We only want the CGH samples.
-    """
-    fields = parse_series_matrix(matrix_path)
-    gsm_ids = fields["!Sample_geo_accession"]
-    return {gsm: "MM" for gsm in gsm_ids}
 
 
 # ============================================================================
@@ -228,30 +175,6 @@ DATASETS = [
         "desc": "Agilent GPL10152",
         "label_fn": assign_labels_gse33685,
         "matrix_file": "GSE33685_series_matrix.txt.gz",
-    },
-    {
-        "name": "GSE31339",
-        "desc": "Affymetrix SNP 6.0",
-        "label_fn": assign_labels_gse31339,
-        "matrix_file": "GSE31339_series_matrix.txt.gz",
-    },
-    {
-        "name": "GSE26849",
-        "desc": "Agilent 244K, MMRC",
-        "label_fn": assign_labels_gse26849,
-        "matrix_file": "GSE26849_series_matrix.txt.gz",
-    },
-    {
-        "name": "GSE44745",
-        "desc": "Agilent 244K, Malaysian",
-        "label_fn": assign_labels_gse44745,
-        "matrix_file": "GSE44745_series_matrix.txt.gz",
-    },
-    {
-        "name": "GSE29023",
-        "desc": "Agilent 244K, paired CGH",
-        "label_fn": assign_labels_gse29023,
-        "matrix_file": "GSE29023_series_matrix.txt.gz",
     },
 ]
 

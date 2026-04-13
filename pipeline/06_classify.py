@@ -192,19 +192,31 @@ def run_lodo_cv(X, y, datasets, feature_names, feat_set_name):
 
 
 def statistical_tests(all_results):
-    """Paired t-test and Wilcoxon on per-fold metrics between feature sets."""
+    """Paired t-test and Wilcoxon on per-fold metrics between feature sets.
+
+    Structured as:
+      Q1 (core):    HMM Basic vs Raw — does HMM discretization help?
+      Q2 (derived): HMM Enhanced vs HMM Basic — do derived features add value?
+      Q3 (combined): Combined vs Raw — does adding HMM help raw?
+      Q4 (combined): Combined vs HMM Enhanced — does adding raw help HMM?
+    """
     comparisons = [
-        ("HMM Enhanced", "Raw Arm (mean+SD)"),
-        ("HMM Enhanced", "HMM Arm Fractions"),
-        ("HMM Enhanced", "HMM + Raw Combined"),
+        ("CBS", "Raw", "Q1: CBS denoising vs raw (core question)"),
+        ("CBS Full", "Raw", "Q2: CBS full features vs raw"),
+        ("CBS", "HMM Basic", "Q3: CBS vs HMM discretization"),
+        ("CBS", "HMM Posterior", "Q4: CBS vs HMM posteriors"),
+        ("HMM Basic", "Raw", "Q5: HMM discretization vs raw"),
+        ("HMM Posterior", "Raw", "Q6: HMM posteriors vs raw"),
+        ("HMM Posterior", "HMM Basic", "Q7: posteriors vs discrete HMM"),
     ]
     model = "Random Forest"
     rows = []
 
     print("\n  === Statistical Significance (RF, paired across CV folds) ===")
-    for ds_a, ds_b in comparisons:
+    for ds_a, ds_b, question in comparisons:
         if ds_a not in all_results or ds_b not in all_results:
             continue
+        print(f"\n  {question}")
         for metric in ["auc", "f1", "bal_acc"]:
             a = np.array(all_results[ds_a][model][metric])
             b = np.array(all_results[ds_b][model][metric])
@@ -213,6 +225,7 @@ def statistical_tests(all_results):
             w_stat, w_pval = stats.wilcoxon(a, b)
             rows.append({
                 "comparison": f"{ds_a} vs {ds_b}",
+                "question": question,
                 "metric": metric.upper(),
                 "mean_diff": diff,
                 "t_statistic": t_stat, "t_pvalue": t_pval,
@@ -220,8 +233,9 @@ def statistical_tests(all_results):
             })
             sig = "***" if t_pval < 0.001 else "**" if t_pval < 0.01 \
                 else "*" if t_pval < 0.05 else "ns"
-            print(f"  {ds_a} vs {ds_b} [{metric.upper()}]: "
-                  f"diff={diff:+.4f}  p={t_pval:.4f} {sig}")
+            winner = ds_a if diff > 0 else ds_b
+            print(f"    {metric.upper()}: diff={diff:+.4f}  p={t_pval:.4f} {sig}"
+                  f"  ({winner} wins)")
 
     df = pd.DataFrame(rows)
     df.to_csv(os.path.join(RESULTS_DIR, "statistical_tests.csv"), index=False)
@@ -290,7 +304,7 @@ def build_raw_arm_features(merged_df, bin_matrix=None):
                 arm_cols = [c for c in arm_bins if c in bin_vals.index]
                 if arm_cols:
                     vals = bin_vals[arm_cols].values.astype(float)
-                    vals = vals[vals != 0]  # skip empty bins
+                    vals = vals[~np.isnan(vals)]  # skip NaN bins only
                     if len(vals) > 0:
                         row[f"mean_{arm_id}"] = float(np.mean(vals))
                         row[f"sd_{arm_id}"] = float(np.std(vals)) if len(vals) > 1 else 0.0
@@ -401,13 +415,17 @@ def build_raw_arm_features(merged_df, bin_matrix=None):
 
 
 def _short_name(ds_name):
-    if "Enhanced" in ds_name:
-        return "HMM+"
-    elif "Combined" in ds_name:
-        return "Combined"
-    elif "Raw" in ds_name:
-        return "Raw"
-    return "HMM"
+    names = {
+        "HMM Basic": "HMM",
+        "HMM Enhanced": "HMM+",
+        "Raw": "Raw",
+        "Combined": "Comb",
+        "HMM Smoothed": "Smooth",
+        "HMM Posterior": "Post",
+        "CBS": "CBS",
+        "CBS Full": "CBS+",
+    }
+    return names.get(ds_name, ds_name)
 
 
 if __name__ == "__main__":
@@ -442,6 +460,10 @@ if __name__ == "__main__":
                   and not c.startswith(("seg_mean_del_", "seg_mean_amp_"))]
     enhanced_cols = all_feat_cols
 
+    # Get the arm set from HMM basic features (41 arms)
+    hmm_arms = sorted(set(c.replace("del_", "").replace("amp_", "")
+                          for c in basic_cols))
+
     X_basic = merged[basic_cols].fillna(0).values
     X_enhanced = merged[enhanced_cols].fillna(0).values
 
@@ -450,31 +472,104 @@ if __name__ == "__main__":
     n_datasets = ds_labels.nunique()
     print(f"Loaded: {n_mgus} MGUS + {n_mm} MM = {len(y)} samples "
           f"from {n_datasets} datasets")
-    print(f"HMM basic features: {X_basic.shape[1]}")
+    print(f"HMM basic features: {X_basic.shape[1]} ({len(hmm_arms)} arms x 2)")
     print(f"HMM enhanced features: {X_enhanced.shape[1]}")
 
     # Build raw arm features (platform-agnostic from bins)
     print("\nBuilding raw arm features from bin-level data...")
     raw_df = build_raw_arm_features(merged, bin_matrix=bin_matrix)
     raw_df.to_csv(os.path.join(FEAT_DIR, "feature_matrix_raw_arm.csv"))
-    X_raw = raw_df.drop(columns=["label"]).fillna(0).values
-    raw_feat_names = raw_df.drop(columns=["label"]).columns.tolist()
-    print(f"Raw features: {X_raw.shape[1]}")
 
-    # Combined
+    # Align raw features to same arm set as HMM for fair comparison
+    raw_aligned_cols = []
+    for arm in hmm_arms:
+        for prefix in ["mean_", "sd_"]:
+            col = f"{prefix}{arm}"
+            if col in raw_df.columns:
+                raw_aligned_cols.append(col)
+    X_raw = raw_df[raw_aligned_cols].fillna(0).values
+    n_raw_total = len([c for c in raw_df.columns if c != "label"])
+    print(f"Raw features (aligned to HMM arms): {X_raw.shape[1]} ({len(hmm_arms)} arms x 2)")
+    if n_raw_total != len(raw_aligned_cols):
+        print(f"  (dropped {n_raw_total - len(raw_aligned_cols)} features "
+              f"from non-HMM arms for fair comparison)")
+
+    # Load HMM Smoothed features (mean + SD of HMM-denoised log2 ratios per arm)
+    smooth_path = os.path.join(FEAT_DIR, "feature_matrix_smoothed_arm.csv")
+    X_smoothed = None
+    smoothed_cols = []
+    if os.path.exists(smooth_path):
+        smooth_df = pd.read_csv(smooth_path, index_col=0)
+        smooth_df = smooth_df.loc[merged.index]
+        # Align to HMM arm set
+        smoothed_cols = []
+        for arm in hmm_arms:
+            for prefix in ["mean_", "sd_"]:
+                col = f"{prefix}{arm}"
+                if col in smooth_df.columns:
+                    smoothed_cols.append(col)
+        X_smoothed = smooth_df[smoothed_cols].fillna(0).values
+        print(f"HMM Smoothed features: {X_smoothed.shape[1]} ({len(hmm_arms)} arms x 2)")
+
+    # Load HMM Posterior features (mean P(del), P(amp) per arm)
+    post_path = os.path.join(FEAT_DIR, "feature_matrix_posterior_arm.csv")
+    X_posterior = None
+    posterior_cols = []
+    if os.path.exists(post_path):
+        post_df = pd.read_csv(post_path, index_col=0)
+        post_df = post_df.loc[merged.index]
+        posterior_cols = []
+        for arm in hmm_arms:
+            for prefix in ["p_del_", "p_amp_"]:
+                col = f"{prefix}{arm}"
+                if col in post_df.columns:
+                    posterior_cols.append(col)
+        X_posterior = post_df[posterior_cols].fillna(0).values
+        print(f"HMM Posterior features: {X_posterior.shape[1]} ({len(hmm_arms)} arms x 2)")
+
+    # Load CBS features (probe-level CBS segmentation, continuous)
+    cbs_path = os.path.join(FEAT_DIR, "feature_matrix_cbs_arm.csv")
+    X_cbs = None
+    cbs_cols = []
+    cbs_mean_cols = []
+    if os.path.exists(cbs_path):
+        cbs_df = pd.read_csv(cbs_path, index_col=0)
+        cbs_df = cbs_df.loc[merged.index]
+        # CBS mean+SD (same format as Raw for fair comparison)
+        cbs_mean_cols = []
+        for arm in hmm_arms:
+            for prefix in ["cbs_mean_", "cbs_sd_"]:
+                col = f"{prefix}{arm}"
+                if col in cbs_df.columns:
+                    cbs_mean_cols.append(col)
+        X_cbs = cbs_df[cbs_mean_cols].fillna(0).values
+        # CBS full (mean + SD + nseg + maxabs)
+        cbs_cols = [c for c in cbs_df.columns if c not in ["label", "dataset"]]
+        X_cbs_full = cbs_df[cbs_cols].fillna(0).values
+        print(f"CBS features (mean+SD): {X_cbs.shape[1]} ({len(hmm_arms)} arms x 2)")
+        print(f"CBS features (full): {X_cbs_full.shape[1]} ({len(hmm_arms)} arms x 4)")
+
+    # Combined: HMM Enhanced + Raw
     X_combined = np.hstack([X_enhanced, X_raw])
-    combined_feat_names = enhanced_cols + raw_feat_names
+    combined_feat_names = enhanced_cols + raw_aligned_cols
     print(f"Combined features: {X_combined.shape[1]}")
 
     # =========================================================================
     # Standard repeated stratified CV
     # =========================================================================
     feature_sets = [
-        ("HMM Arm Fractions", X_basic, basic_cols),
+        ("HMM Basic", X_basic, basic_cols),
         ("HMM Enhanced", X_enhanced, enhanced_cols),
-        ("Raw Arm (mean+SD)", X_raw, raw_feat_names),
-        ("HMM + Raw Combined", X_combined, combined_feat_names),
+        ("Raw", X_raw, raw_aligned_cols),
+        ("Combined", X_combined, combined_feat_names),
     ]
+    if X_smoothed is not None:
+        feature_sets.append(("HMM Smoothed", X_smoothed, smoothed_cols))
+    if X_posterior is not None:
+        feature_sets.append(("HMM Posterior", X_posterior, posterior_cols))
+    if X_cbs is not None:
+        feature_sets.append(("CBS", X_cbs, cbs_mean_cols))
+        feature_sets.append(("CBS Full", X_cbs_full, cbs_cols))
 
     all_results = {}
     all_summaries = []
@@ -552,15 +647,26 @@ if __name__ == "__main__":
     # Plot 2: ROC curves
     fig, ax = plt.subplots(figsize=(8, 8))
     plot_configs = [
-        ("HMM Arm Fractions", "Random Forest", "steelblue", "-"),
-        ("HMM Arm Fractions", "Logistic Regression L1", "steelblue", "--"),
+        ("HMM Basic", "Random Forest", "steelblue", "-"),
+        ("HMM Basic", "Logistic Regression L1", "steelblue", "--"),
         ("HMM Enhanced", "Random Forest", "forestgreen", "-"),
         ("HMM Enhanced", "Logistic Regression L1", "forestgreen", "--"),
-        ("Raw Arm (mean+SD)", "Random Forest", "firebrick", "-"),
-        ("Raw Arm (mean+SD)", "Logistic Regression L1", "firebrick", "--"),
-        ("HMM + Raw Combined", "Random Forest", "darkorange", "-"),
-        ("HMM + Raw Combined", "Logistic Regression L1", "darkorange", "--"),
+        ("Raw", "Random Forest", "firebrick", "-"),
+        ("Raw", "Logistic Regression L1", "firebrick", "--"),
+        ("Combined", "Random Forest", "darkorange", "-"),
+        ("Combined", "Logistic Regression L1", "darkorange", "--"),
+        ("HMM Smoothed", "Random Forest", "darkorchid", "-"),
+        ("HMM Smoothed", "Logistic Regression L1", "darkorchid", "--"),
+        ("HMM Posterior", "Random Forest", "teal", "-"),
+        ("HMM Posterior", "Logistic Regression L1", "teal", "--"),
+        ("CBS", "Random Forest", "deeppink", "-"),
+        ("CBS", "Logistic Regression L1", "deeppink", "--"),
+        ("CBS Full", "Random Forest", "gold", "-"),
+        ("CBS Full", "Logistic Regression L1", "gold", "--"),
     ]
+    # Only plot feature sets that were actually evaluated
+    plot_configs = [(n, m, c, ls) for n, m, c, ls in plot_configs
+                    if n in all_results]
 
     for ds_name, model_name, color, ls in plot_configs:
         r = all_results[ds_name][model_name]

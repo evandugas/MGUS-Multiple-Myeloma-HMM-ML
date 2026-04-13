@@ -112,15 +112,23 @@ if __name__ == "__main__":
     X_basic = merged[basic_cols].fillna(0).values
     X_enhanced = merged[enhanced_cols].fillna(0).values
 
-    # Load raw features
+    # Load raw features (aligned to same arms as HMM)
     raw_path = os.path.join(FEAT_DIR, "feature_matrix_raw_arm.csv")
     if os.path.exists(raw_path):
         raw_df = pd.read_csv(raw_path, index_col=0)
         raw_df = raw_df.loc[merged.index]
-        X_raw = raw_df.drop(columns=["label"]).fillna(0).values
-        raw_feat_names = raw_df.drop(columns=["label"]).columns.tolist()
+        # Align to HMM arm set
+        hmm_arms = sorted(set(c.replace("del_", "").replace("amp_", "")
+                              for c in basic_cols))
+        raw_aligned_cols = []
+        for arm in hmm_arms:
+            for prefix in ["mean_", "sd_"]:
+                col = f"{prefix}{arm}"
+                if col in raw_df.columns:
+                    raw_aligned_cols.append(col)
+        X_raw = raw_df[raw_aligned_cols].fillna(0).values
     else:
-        print("WARNING: Raw features not found. Run 04_classification.py first.")
+        print("WARNING: Raw features not found. Run 06_classify.py first.")
         X_raw = None
 
     # Combined
@@ -134,9 +142,9 @@ if __name__ == "__main__":
         ("HMM Enhanced", X_enhanced),
     ]
     if X_raw is not None:
-        feature_sets.append(("Raw (mean+SD)", X_raw))
+        feature_sets.append(("Raw", X_raw))
     if X_combined is not None:
-        feature_sets.append(("HMM + Raw Combined", X_combined))
+        feature_sets.append(("Combined", X_combined))
 
     all_results = {}
     all_summaries = []

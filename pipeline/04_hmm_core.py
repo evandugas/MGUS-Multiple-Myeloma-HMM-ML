@@ -14,24 +14,57 @@ import numpy as np
 from hmmlearn.hmm import GaussianHMM
 
 N_STATES = 3
-MIN_MEAN_SEP = 0.05  # was 0.10 — lowered to detect subtle MGUS CNAs
-DEFAULT_MIN_CNA_PROBES = 5  # was 10 — lowered to preserve focal events
+MIN_MEAN_SEP = 0.03  # was 0.05 — lowered to keep subtle MGUS-level CNA states
+DEFAULT_MIN_CNA_PROBES = 3  # was 5 — preserves 3Mb+ segments at 1Mb bins
 
-# Less sticky transitions: 0.995 self-transition (was 0.999)
-# Allows the HMM to detect shorter CNA segments and arm-level events
-# with gradual boundaries
 DEFAULT_TRANSMAT = np.array([
     [0.995, 0.004, 0.001],
     [0.002, 0.995, 0.003],
     [0.001, 0.004, 0.995],
 ])
 
-DEFAULT_STARTPROB = np.array([0.05, 0.90, 0.05])
+DEFAULT_STARTPROB = np.array([0.10, 0.80, 0.10])
 DEFAULT_MEANS = np.array([[-0.3], [0.0], [0.3]])
 DEFAULT_COVARS = np.array([[0.03], [0.005], [0.03]])
 
 
-def fit_hmm_chromosome(args, transmat=None):
+def adaptive_emission_params(all_log_ratios):
+    """Compute per-sample emission initialization from data quantiles.
+
+    Uses [Q10, median, Q90] as initial means instead of hard-coded values.
+    This adapts to the actual signal range of each platform/sample.
+
+    Args:
+        all_log_ratios: dict of chrom -> log_ratio array (one sample)
+
+    Returns:
+        (means, covars) as (3x1, 3x1) numpy arrays
+    """
+    all_vals = np.concatenate(list(all_log_ratios.values()))
+    if len(all_vals) < 20:
+        return DEFAULT_MEANS.copy(), DEFAULT_COVARS.copy()
+
+    q10 = np.percentile(all_vals, 10)
+    q50 = np.median(all_vals)
+    q90 = np.percentile(all_vals, 90)
+
+    # Ensure minimum separation between states
+    if (q50 - q10) < 0.02:
+        q10 = q50 - 0.1
+    if (q90 - q50) < 0.02:
+        q90 = q50 + 0.1
+
+    means = np.array([[q10], [q50], [q90]])
+    # Covariances based on data spread
+    iqr = np.percentile(all_vals, 75) - np.percentile(all_vals, 25)
+    cna_var = max(iqr ** 2, 0.01)
+    neutral_var = max((iqr / 3) ** 2, 0.002)
+    covars = np.array([[cna_var], [neutral_var], [cna_var]])
+
+    return means, covars
+
+
+def fit_hmm_chromosome(args, transmat=None, init_means=None, init_covars=None):
     """Two-pass 3-state Gaussian HMM for one chromosome.
 
     Pass 1: Learn all parameters from data.
@@ -39,6 +72,7 @@ def fit_hmm_chromosome(args, transmat=None):
 
     If transmat is provided (pooled mode), it is used as the fixed transition
     matrix and not updated during fitting.
+    If init_means/init_covars are provided, they override DEFAULT_MEANS/COVARS.
     """
     chrom, log_ratios, starts, ends = args
 
@@ -61,8 +95,8 @@ def fit_hmm_chromosome(args, transmat=None):
     )
     model.startprob_ = DEFAULT_STARTPROB.copy()
     model.transmat_ = transmat.copy() if use_pooled else DEFAULT_TRANSMAT.copy()
-    model.means_ = DEFAULT_MEANS.copy()
-    model.covars_ = DEFAULT_COVARS.copy()
+    model.means_ = init_means.copy() if init_means is not None else DEFAULT_MEANS.copy()
+    model.covars_ = init_covars.copy() if init_covars is not None else DEFAULT_COVARS.copy()
 
     try:
         with warnings.catch_warnings():
@@ -73,7 +107,9 @@ def fit_hmm_chromosome(args, transmat=None):
 
     if np.any(np.isnan(model.means_)) or np.any(np.isnan(model.startprob_)):
         states = np.ones(len(log_ratios), dtype=int)
-        return chrom, states, np.array([-0.3, 0.0, 0.3]), np.array([0.03, 0.005, 0.03])
+        posteriors = np.zeros((len(log_ratios), N_STATES))
+        posteriors[:, 1] = 1.0  # all neutral
+        return chrom, states, np.array([-0.3, 0.0, 0.3]), np.array([0.03, 0.005, 0.03]), posteriors
 
     order = np.argsort(model.means_.flatten())
     sorted_means = model.means_.flatten()[order]
@@ -84,24 +120,29 @@ def fit_hmm_chromosome(args, transmat=None):
 
     try:
         states = model.predict(X)
+        posteriors_raw = model.predict_proba(X)
     except Exception:
         states = np.ones(len(log_ratios), dtype=int)
-        return chrom, states, sorted_means, sorted_covars
+        posteriors = np.zeros((len(log_ratios), N_STATES))
+        posteriors[:, 1] = 1.0
+        return chrom, states, sorted_means, sorted_covars, posteriors
 
+    # Reorder states and posteriors by mean (del=0, neutral=1, amp=2)
     remap = np.zeros(N_STATES, dtype=int)
     for new_idx, old_idx in enumerate(order):
         remap[old_idx] = new_idx
     states = remap[states]
+    posteriors = posteriors_raw[:, order]
 
     if del_sep < MIN_MEAN_SEP:
         states[states == 0] = 1
     if amp_sep < MIN_MEAN_SEP:
         states[states == 2] = 1
 
-    return chrom, states, sorted_means, sorted_covars
+    return chrom, states, sorted_means, sorted_covars, posteriors
 
 
-def estimate_pooled_transmat(all_log_ratios):
+def estimate_pooled_transmat(all_log_ratios, init_means=None, init_covars=None):
     """Estimate a shared transition matrix from all chromosomes in a sample.
 
     First pass: fit each chromosome independently, collect transition counts.
@@ -109,11 +150,15 @@ def estimate_pooled_transmat(all_log_ratios):
 
     Args:
         all_log_ratios: dict of chrom -> log_ratio array
+        init_means: adaptive emission means (3x1), or None for defaults
+        init_covars: adaptive emission covariances (3x1), or None for defaults
 
     Returns:
         Pooled transition matrix (3x3 numpy array)
     """
     trans_counts = np.zeros((N_STATES, N_STATES))
+    means = init_means if init_means is not None else DEFAULT_MEANS.copy()
+    covars = init_covars if init_covars is not None else DEFAULT_COVARS.copy()
 
     for chrom, lr in all_log_ratios.items():
         if len(lr) < 10:
@@ -131,8 +176,8 @@ def estimate_pooled_transmat(all_log_ratios):
         )
         model.startprob_ = DEFAULT_STARTPROB.copy()
         model.transmat_ = DEFAULT_TRANSMAT.copy()
-        model.means_ = DEFAULT_MEANS.copy()
-        model.covars_ = DEFAULT_COVARS.copy()
+        model.means_ = means.copy()
+        model.covars_ = covars.copy()
 
         try:
             with warnings.catch_warnings():

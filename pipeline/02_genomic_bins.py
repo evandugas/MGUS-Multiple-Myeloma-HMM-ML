@@ -80,25 +80,6 @@ for chrom in CHROMOSOMES:
     _offset += len(starts)
 
 
-def assign_probe_to_bin(chrom, position):
-    """Map a single probe to its bin index.
-
-    Args:
-        chrom: Chromosome name (e.g., "chr1")
-        position: Genomic position in base pairs
-
-    Returns:
-        Global bin index, or -1 if chromosome not recognized
-    """
-    if chrom not in _chrom_bin_starts:
-        return -1
-    local_idx = int(position // BIN_SIZE)
-    n_bins_chrom = len(_chrom_bin_starts[chrom])
-    if local_idx >= n_bins_chrom:
-        local_idx = n_bins_chrom - 1
-    return _chrom_bin_offset[chrom] + local_idx
-
-
 def compute_bin_values(probes_df):
     """Compute median log2 ratio per genomic bin for one sample.
 
@@ -129,7 +110,7 @@ def compute_bin_values(probes_df):
 
     for i in range(N_BINS):
         if bin_probes[i]:
-            bin_values[i] = np.median(bin_probes[i])
+            bin_values[i] = np.mean(bin_probes[i])
 
     return bin_values
 
