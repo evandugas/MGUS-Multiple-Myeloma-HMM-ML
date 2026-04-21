@@ -21,12 +21,12 @@ We built a **cohort-trained Gaussian HMM** to segment probe-level aCGH copy numb
 
 | Feature Set | Model | AUC | F1 | Balanced Accuracy |
 |-------------|-------|-----|-----|-------------------|
-| HMM | RF | 0.871 | 0.578 | 0.714 |
-| HMM | LR | 0.819 | 0.624 | 0.743 |
+| HMM | RF | 0.882 | **0.592** | **0.719** |
+| HMM | LR | 0.854 | 0.661 | 0.768 |
 | Raw | RF | 0.884 | 0.512 | 0.678 |
-| Raw | LR | 0.926 | 0.743 | 0.822 |
+| Raw | LR | **0.926** | **0.743** | **0.822** |
 
-**HMM vs Raw (RF)**: AUC difference = -0.013, p = 0.24 (not significant). HMM trends better on F1 (p=0.065) and balanced accuracy (p=0.053).
+**HMM vs Raw (RF)**: AUC virtually identical (0.882 vs 0.884, p=0.85). HMM significantly better on F1 (0.592 vs 0.512, p=0.034) and balanced accuracy (0.719 vs 0.678, p=0.034).
 
 **Significant CNA regions** (Wilcoxon, q < 0.05): chr13q, chr14q, chr8p, chr1p, chr4p — all known MM-associated deletions.
 
@@ -41,7 +41,7 @@ We built a **cohort-trained Gaussian HMM** to segment probe-level aCGH copy numb
 
 ## Conclusion
 
-HMM segmentation achieves **statistically comparable classification performance** to raw features (AUC 0.871 vs 0.884, p=0.24) while providing biologically interpretable CNA profiles. The cohort-trained approach with BIC model selection produces consistent, biologically correct segmentation across samples from different array platforms. Raw features retain a slight edge on AUC, likely because continuous log2 ratios preserve signal magnitude that is lost in discrete state assignment.
+HMM segmentation achieves **equivalent AUC** to raw features (0.882 vs 0.884, p=0.85) and **significantly better F1 and balanced accuracy** (p=0.034), indicating that HMM-derived structural features (segment counts, CNA burden) improve classification decisions for the minority MM class. The cohort-trained approach with BIC model selection produces biologically correct segmentation across samples from different array platforms. Segment count normalization by probe density was critical to remove platform-related confounds.
 
 ## Setup
 
