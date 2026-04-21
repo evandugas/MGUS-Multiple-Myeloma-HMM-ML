@@ -1,229 +1,253 @@
-###############################################################################
-# HMM core functions — shared between 02_hmm_segmentation.py and
-# 01_process_all_datasets.py
-#
-# v2: Optimized parameters for MGUS detection
-#   - Lower MIN_MEAN_SEP (0.05) to catch subtle MGUS CNAs
-#   - Less sticky transitions (0.995) to improve state switching
-#   - Pooled transition matrix support for stable cross-chromosome estimates
-#   - Lower default MIN_CNA_PROBES (5) to preserve focal events
-###############################################################################
+"""Gaussian HMM for copy number segmentation.
+
+Two-stage cohort-trained approach:
+  Stage 0: BIC model selection (3, 4, 5 states)
+  Stage 1: Train shared emission parameters from all samples (Baum-Welch)
+  Stage 2: Per-sample decoding with fixed emissions (Viterbi)
+"""
 
 import warnings
 import numpy as np
 from hmmlearn.hmm import GaussianHMM
 
-N_STATES = 3
-MIN_MEAN_SEP = 0.03  # was 0.05 — lowered to keep subtle MGUS-level CNA states
-DEFAULT_MIN_CNA_PROBES = 3  # was 5 — preserves 3Mb+ segments at 1Mb bins
+MIN_CNA_PROBES = 5
 
-DEFAULT_TRANSMAT = np.array([
-    [0.995, 0.004, 0.001],
-    [0.002, 0.995, 0.003],
-    [0.001, 0.004, 0.995],
-])
-
-DEFAULT_STARTPROB = np.array([0.10, 0.80, 0.10])
-DEFAULT_MEANS = np.array([[-0.3], [0.0], [0.3]])
-DEFAULT_COVARS = np.array([[0.03], [0.005], [0.03]])
-
-
-def adaptive_emission_params(all_log_ratios):
-    """Compute per-sample emission initialization from data quantiles.
-
-    Uses [Q10, median, Q90] as initial means instead of hard-coded values.
-    This adapts to the actual signal range of each platform/sample.
-
-    Args:
-        all_log_ratios: dict of chrom -> log_ratio array (one sample)
-
-    Returns:
-        (means, covars) as (3x1, 3x1) numpy arrays
-    """
-    all_vals = np.concatenate(list(all_log_ratios.values()))
-    if len(all_vals) < 20:
-        return DEFAULT_MEANS.copy(), DEFAULT_COVARS.copy()
-
-    q10 = np.percentile(all_vals, 10)
-    q50 = np.median(all_vals)
-    q90 = np.percentile(all_vals, 90)
-
-    # Ensure minimum separation between states
-    if (q50 - q10) < 0.02:
-        q10 = q50 - 0.1
-    if (q90 - q50) < 0.02:
-        q90 = q50 + 0.1
-
-    means = np.array([[q10], [q50], [q90]])
-    # Covariances based on data spread
-    iqr = np.percentile(all_vals, 75) - np.percentile(all_vals, 25)
-    cna_var = max(iqr ** 2, 0.01)
-    neutral_var = max((iqr / 3) ** 2, 0.002)
-    covars = np.array([[cna_var], [neutral_var], [cna_var]])
-
-    return means, covars
+# Defaults for 3-state (overridden by BIC selection)
+INIT_CONFIGS = {
+    3: {
+        "startprob": np.array([0.10, 0.80, 0.10]),
+        "transmat": np.array([
+            [0.995, 0.004, 0.001],
+            [0.002, 0.995, 0.003],
+            [0.001, 0.004, 0.995]]),
+        "means": np.array([[-0.3], [0.0], [0.3]]),
+        "covars": np.array([[0.03], [0.005], [0.03]]),
+    },
+    4: {
+        "startprob": np.array([0.05, 0.10, 0.75, 0.10]),
+        "transmat": np.array([
+            [0.990, 0.008, 0.001, 0.001],
+            [0.004, 0.990, 0.005, 0.001],
+            [0.001, 0.004, 0.990, 0.005],
+            [0.001, 0.001, 0.008, 0.990]]),
+        "means": np.array([[-0.5], [-0.15], [0.0], [0.2]]),
+        "covars": np.array([[0.05], [0.01], [0.005], [0.02]]),
+    },
+    5: {
+        "startprob": np.array([0.02, 0.08, 0.76, 0.10, 0.04]),
+        "transmat": np.array([
+            [0.990, 0.008, 0.001, 0.001, 0.000],
+            [0.004, 0.990, 0.005, 0.001, 0.000],
+            [0.001, 0.003, 0.990, 0.005, 0.001],
+            [0.000, 0.001, 0.005, 0.990, 0.004],
+            [0.000, 0.001, 0.001, 0.008, 0.990]]),
+        "means": np.array([[-0.5], [-0.15], [0.0], [0.15], [0.5]]),
+        "covars": np.array([[0.05], [0.01], [0.005], [0.01], [0.05]]),
+    },
+}
 
 
-def fit_hmm_chromosome(args, transmat=None, init_means=None, init_covars=None):
-    """Two-pass 3-state Gaussian HMM for one chromosome.
-
-    Pass 1: Learn all parameters from data.
-    Pass 2: Validate mean separation — collapse states too close to neutral.
-
-    If transmat is provided (pooled mode), it is used as the fixed transition
-    matrix and not updated during fitting.
-    If init_means/init_covars are provided, they override DEFAULT_MEANS/COVARS.
-    """
-    chrom, log_ratios, starts, ends = args
-
-    if len(log_ratios) < 10:
-        return None
-
-    X = log_ratios.reshape(-1, 1)
-
-    use_pooled = transmat is not None
-    params_to_fit = "smc" if use_pooled else "stmc"
-
+def _fit_model(n_states, X, lengths):
+    """Fit a single HMM with n_states and return (model, log_likelihood)."""
+    cfg = INIT_CONFIGS[n_states]
     model = GaussianHMM(
-        n_components=N_STATES,
-        covariance_type="diag",
-        n_iter=200,
-        tol=0.001,
-        random_state=42,
-        init_params="",
-        params=params_to_fit,
+        n_components=n_states, covariance_type="diag",
+        n_iter=100, tol=0.01, random_state=42,
+        init_params="", params="stmc",
     )
-    model.startprob_ = DEFAULT_STARTPROB.copy()
-    model.transmat_ = transmat.copy() if use_pooled else DEFAULT_TRANSMAT.copy()
-    model.means_ = init_means.copy() if init_means is not None else DEFAULT_MEANS.copy()
-    model.covars_ = init_covars.copy() if init_covars is not None else DEFAULT_COVARS.copy()
+    model.startprob_ = cfg["startprob"].copy()
+    model.transmat_ = cfg["transmat"].copy()
+    model.means_ = cfg["means"].copy()
+    model.covars_ = cfg["covars"].copy()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model.fit(X, lengths=lengths)
+
+    ll = model.score(X, lengths=lengths)
+    return model, ll
+
+
+def select_n_states(all_sequences, max_sequences=300):
+    """Stage 0: BIC model selection across 3, 4, 5 states.
+
+    BIC = -2 * log_likelihood + n_params * ln(n_samples)
+    Lower BIC = better model (balances fit vs complexity).
+    """
+    if len(all_sequences) > max_sequences:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(len(all_sequences), max_sequences, replace=False)
+        seqs = [all_sequences[i] for i in idx]
+    else:
+        seqs = list(all_sequences)
+
+    seqs = [s for s in seqs if len(s) >= 20]
+    X = np.concatenate(seqs).reshape(-1, 1)
+    lengths = [len(s) for s in seqs]
+    n_obs = len(X)
+
+    print(f"    BIC selection: {len(seqs)} sequences, {n_obs:,} probes", flush=True)
+
+    best_n, best_bic = 3, np.inf
+    for n in [3, 4, 5]:
+        try:
+            model, ll = _fit_model(n, X, lengths)
+            # n_params = transitions + means + covars + startprob
+            n_params = n * (n - 1) + n + n + (n - 1)
+            bic = -2 * ll + n_params * np.log(n_obs)
+            print(f"      {n} states: LL={ll:,.0f}  BIC={bic:,.0f}  "
+                  f"params={n_params}", flush=True)
+            if bic < best_bic:
+                best_bic = bic
+                best_n = n
+        except Exception as e:
+            print(f"      {n} states: failed ({e})", flush=True)
+
+    print(f"    Selected: {best_n} states (lowest BIC)", flush=True)
+    return best_n
+
+
+def train_cohort_model(all_sequences, n_states, max_sequences=500):
+    """Stage 1: Learn emission parameters from the full cohort.
+
+    Returns (n_states, means, covars, transmat) with states ordered by mean.
+    """
+    if len(all_sequences) > max_sequences:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(len(all_sequences), max_sequences, replace=False)
+        sequences = [all_sequences[i] for i in idx]
+    else:
+        sequences = list(all_sequences)
+
+    sequences = [s for s in sequences if len(s) >= 20]
+    cfg = INIT_CONFIGS[n_states]
+
+    if not sequences:
+        return n_states, cfg["means"].copy(), cfg["covars"].copy(), cfg["transmat"].copy()
+
+    X = np.concatenate(sequences).reshape(-1, 1)
+    lengths = [len(s) for s in sequences]
+
+    print(f"    Training {n_states}-state HMM: {len(sequences)} sequences, "
+          f"{len(X):,} probes", flush=True)
 
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            model.fit(X)
-    except Exception:
-        return None
-
-    if np.any(np.isnan(model.means_)) or np.any(np.isnan(model.startprob_)):
-        states = np.ones(len(log_ratios), dtype=int)
-        posteriors = np.zeros((len(log_ratios), N_STATES))
-        posteriors[:, 1] = 1.0  # all neutral
-        return chrom, states, np.array([-0.3, 0.0, 0.3]), np.array([0.03, 0.005, 0.03]), posteriors
+        model, _ = _fit_model(n_states, X, lengths)
+    except Exception as e:
+        print(f"    Training failed: {e}", flush=True)
+        return n_states, cfg["means"].copy(), cfg["covars"].copy(), cfg["transmat"].copy()
 
     order = np.argsort(model.means_.flatten())
-    sorted_means = model.means_.flatten()[order]
-    sorted_covars = model.covars_.flatten()[order]
+    means = model.means_[order].reshape(n_states, 1)
+    covars = model.covars_[order].reshape(n_states, 1)
+    transmat = model.transmat_[order][:, order]
 
-    del_sep = sorted_means[1] - sorted_means[0]
-    amp_sep = sorted_means[2] - sorted_means[1]
+    m = means.flatten()
+    s = np.sqrt(covars.flatten())
+    labels = ["del", "neut", "amp"] if n_states == 3 else \
+             [f"s{i}" for i in range(n_states)]
+    if n_states == 4:
+        labels = ["deep_del", "del", "neut", "amp"]
+    elif n_states == 5:
+        labels = ["deep_del", "del", "neut", "gain", "high_amp"]
 
-    try:
-        states = model.predict(X)
-        posteriors_raw = model.predict_proba(X)
-    except Exception:
-        states = np.ones(len(log_ratios), dtype=int)
-        posteriors = np.zeros((len(log_ratios), N_STATES))
-        posteriors[:, 1] = 1.0
-        return chrom, states, sorted_means, sorted_covars, posteriors
+    print(f"    Learned states:", flush=True)
+    for i in range(n_states):
+        print(f"      {labels[i]:<10}: mean={m[i]:+.4f}  SD={s[i]:.4f}", flush=True)
 
-    # Reorder states and posteriors by mean (del=0, neutral=1, amp=2)
-    remap = np.zeros(N_STATES, dtype=int)
-    for new_idx, old_idx in enumerate(order):
-        remap[old_idx] = new_idx
-    states = remap[states]
-    posteriors = posteriors_raw[:, order]
-
-    if del_sep < MIN_MEAN_SEP:
-        states[states == 0] = 1
-    if amp_sep < MIN_MEAN_SEP:
-        states[states == 2] = 1
-
-    return chrom, states, sorted_means, sorted_covars, posteriors
+    return n_states, means, covars, transmat
 
 
-def estimate_pooled_transmat(all_log_ratios, init_means=None, init_covars=None):
-    """Estimate a shared transition matrix from all chromosomes in a sample.
+def decode_sample(chrom_data, n_states, cohort_means, cohort_covars,
+                  cohort_transmat, sample_id):
+    """Stage 2: Decode one sample with fixed cohort emissions.
 
-    First pass: fit each chromosome independently, collect transition counts.
-    Second pass: normalize to get a pooled transition matrix.
-
-    Args:
-        all_log_ratios: dict of chrom -> log_ratio array
-        init_means: adaptive emission means (3x1), or None for defaults
-        init_covars: adaptive emission covariances (3x1), or None for defaults
-
-    Returns:
-        Pooled transition matrix (3x3 numpy array)
+    Fits per-sample transition matrix, then Viterbi decodes each chromosome.
+    Returns list of (sample_id, chrom, start, log_ratio, state) tuples.
+    State mapping: neutral = n_states // 2, del < neutral, amp > neutral.
     """
-    trans_counts = np.zeros((N_STATES, N_STATES))
-    means = init_means if init_means is not None else DEFAULT_MEANS.copy()
-    covars = init_covars if init_covars is not None else DEFAULT_COVARS.copy()
+    valid = {c: d for c, d in chrom_data.items() if len(d[0]) >= 20}
+    if not valid:
+        return []
 
-    for chrom, lr in all_log_ratios.items():
-        if len(lr) < 10:
-            continue
+    cfg = INIT_CONFIGS[n_states]
+    means = cohort_means.reshape(n_states, 1)
+    covars = cohort_covars.reshape(n_states, 1)
+    neutral = n_states // 2
 
-        X = lr.reshape(-1, 1)
+    # Fit per-sample transitions
+    trans_counts = np.zeros((n_states, n_states))
+    for chrom, (lr, starts) in valid.items():
         model = GaussianHMM(
-            n_components=N_STATES,
-            covariance_type="diag",
-            n_iter=100,
-            tol=0.01,
-            random_state=42,
-            init_params="",
-            params="stmc",
+            n_components=n_states, covariance_type="diag",
+            n_iter=50, tol=0.01, random_state=42,
+            init_params="", params="st",
         )
-        model.startprob_ = DEFAULT_STARTPROB.copy()
-        model.transmat_ = DEFAULT_TRANSMAT.copy()
+        model.startprob_ = cfg["startprob"].copy()
+        model.transmat_ = cohort_transmat.copy()
         model.means_ = means.copy()
         model.covars_ = covars.copy()
 
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                model.fit(X)
-            states = model.predict(X)
+                model.fit(lr.reshape(-1, 1))
+            states = model.predict(lr.reshape(-1, 1))
+            for i in range(len(states) - 1):
+                trans_counts[states[i], states[i + 1]] += 1
         except Exception:
             continue
 
-        # Reorder states by mean
-        order = np.argsort(model.means_.flatten())
-        remap = np.zeros(N_STATES, dtype=int)
-        for new_idx, old_idx in enumerate(order):
-            remap[old_idx] = new_idx
-        states = remap[states]
-
-        # Accumulate transition counts
-        for i in range(len(states) - 1):
-            trans_counts[states[i], states[i + 1]] += 1
-
-    # Normalize rows
     row_sums = trans_counts.sum(axis=1, keepdims=True)
-    row_sums[row_sums == 0] = 1  # avoid division by zero
-    pooled = trans_counts / row_sums
+    row_sums[row_sums == 0] = 1
+    sample_transmat = trans_counts / row_sums
+    for i in range(n_states):
+        if sample_transmat[i].sum() < 0.01:
+            sample_transmat[i] = cohort_transmat[i]
 
-    # Ensure valid (no zero rows)
-    for i in range(N_STATES):
-        if pooled[i].sum() < 0.01:
-            pooled[i] = DEFAULT_TRANSMAT[i]
+    # Viterbi decode
+    results = []
+    for chrom, (lr, starts) in valid.items():
+        model = GaussianHMM(
+            n_components=n_states, covariance_type="diag",
+            init_params="", params="",
+        )
+        model.startprob_ = cfg["startprob"].copy()
+        model.transmat_ = sample_transmat.copy()
+        model.means_ = means.copy()
+        model.covars_ = covars.copy()
 
-    return pooled
+        try:
+            states = model.predict(lr.reshape(-1, 1))
+        except Exception:
+            continue
+
+        states = postprocess_states(states, neutral)
+        # Remap to 3 categories: 0=del, 1=neutral, 2=amp
+        for i in range(len(states)):
+            if states[i] < neutral:
+                cat = 0  # deletion
+            elif states[i] > neutral:
+                cat = 2  # amplification
+            else:
+                cat = 1  # neutral
+            results.append((sample_id, chrom, int(starts[i]),
+                            float(lr[i]), cat))
+
+    return results
 
 
-def postprocess_states(states, min_cna_probes=None):
-    """Filter short CNA runs back to neutral."""
-    if min_cna_probes is None:
-        min_cna_probes = DEFAULT_MIN_CNA_PROBES
+def postprocess_states(states, neutral_state):
+    """Filter short CNA segments back to neutral."""
     states = states.copy()
     i = 0
     while i < len(states):
-        if states[i] != 1:
+        if states[i] != neutral_state:
             j = i
             while j < len(states) and states[j] == states[i]:
                 j += 1
-            if (j - i) < min_cna_probes:
-                states[i:j] = 1
+            if (j - i) < MIN_CNA_PROBES:
+                states[i:j] = neutral_state
             i = j
         else:
             i += 1
