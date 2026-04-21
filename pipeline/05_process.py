@@ -129,6 +129,20 @@ def compute_hmm_features(probe_states_df, labels_dict):
                 i += 1
 
     samples = result.index
+
+    # Normalize segment counts by probe count per sample
+    # (removes platform density confound: 60K arrays produce more segments than 1M)
+    sample_probe_counts = df.groupby("sample_id").size()
+    for s in samples:
+        n_probes = sample_probe_counts.get(s, 1)
+        # Segments per 10K probes — comparable across platforms
+        scale = 10000.0 / n_probes
+        seg[s]["n_seg"] *= scale
+        seg[s]["n_del_seg"] *= scale
+        seg[s]["n_amp_seg"] *= scale
+        for arm in arm_seg_count[s]:
+            arm_seg_count[s][arm] *= scale
+
     result["n_segments"] = [seg[s]["n_seg"] for s in samples]
     result["n_del_segments"] = [seg[s]["n_del_seg"] for s in samples]
     result["n_amp_segments"] = [seg[s]["n_amp_seg"] for s in samples]
