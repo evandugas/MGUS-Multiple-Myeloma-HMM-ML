@@ -45,8 +45,11 @@ def parse_series_matrix(matrix_path):
     return fields
 
 
-def assign_labels_gpl11358(matrix_path):
-    """GPL11358: 103 MGUS + 16 MM from title/characteristics."""
+def assign_labels_gpl11358(matrix_path, platform="GPL11358"):
+    """GPL11358: 103 MGUS + 16 MM from title/characteristics.
+
+    Returns dict gsm -> (label, platform).
+    """
     fields = parse_series_matrix(matrix_path)
     gsm_ids = fields["!Sample_geo_accession"]
     titles = fields["!Sample_title"]
@@ -60,22 +63,22 @@ def assign_labels_gpl11358(matrix_path):
 
         if "NORMAL" in title_upper or "PAIRED" in title_upper or \
            (title_upper.startswith("MGUS-") and "N_" in title.split("-")[1]):
-            labels[gsm] = "excluded"
+            labels[gsm] = ("excluded", platform)
         elif "DISEASE STATE: MULTIPLE MYELOMA" in chars_upper or title_upper.startswith("MM-"):
-            labels[gsm] = "MM"
+            labels[gsm] = ("MM", platform)
         elif "DISEASE STATE: MONOCLONAL GAMMOPATHY" in chars_upper or title_upper.startswith("MGUS"):
-            labels[gsm] = "MGUS"
+            labels[gsm] = ("MGUS", platform)
         else:
-            labels[gsm] = "excluded"
+            labels[gsm] = ("excluded", platform)
 
     return labels
 
 
-def assign_labels_other_platforms(matrix_path):
+def assign_labels_other_platforms(matrix_path, platform):
     """Other platforms (GPL10152, GPL16237, GPL21461): all MM samples."""
     fields = parse_series_matrix(matrix_path)
     gsm_ids = fields["!Sample_geo_accession"]
-    return {gsm: "MM" for gsm in gsm_ids}
+    return {gsm: ("MM", platform) for gsm in gsm_ids}
 
 
 def sort_files(labels):
@@ -116,7 +119,8 @@ def sort_files(labels):
 
     for filename in raw_files:
         gsm_id = filename.split("_")[0].split(".")[0]
-        label = labels.get(gsm_id, "excluded")
+        entry = labels.get(gsm_id, ("excluded", ""))
+        label = entry[0] if isinstance(entry, tuple) else entry
 
         if label == "MGUS":
             dest = "mgus"
@@ -140,15 +144,15 @@ if __name__ == "__main__":
     print(" Sorting GSE77975 samples (all 4 platforms)")
     print("=" * 50)
 
-    # Collect labels from all platform matrices
+    # Collect labels from all platform matrices (gsm -> (label, platform))
     all_labels = {}
 
     # GPL11358: main platform (103 MGUS + 16 MM + 13 normal)
     matrix_11358 = os.path.join(DATA_DIR, "GSE77975-GPL11358_series_matrix.txt.gz")
     if os.path.exists(matrix_11358):
-        labels = assign_labels_gpl11358(matrix_11358)
+        labels = assign_labels_gpl11358(matrix_11358, "GPL11358")
         all_labels.update(labels)
-        counts = Counter(labels.values())
+        counts = Counter(v[0] for v in labels.values())
         print(f"  GPL11358: {dict(counts)}")
     else:
         print(f"  WARNING: {matrix_11358} not found")
@@ -157,29 +161,30 @@ if __name__ == "__main__":
     for gpl in ["GPL10152", "GPL16237", "GPL21461"]:
         matrix_path = os.path.join(DATA_DIR, f"GSE77975-{gpl}_series_matrix.txt.gz")
         if os.path.exists(matrix_path):
-            labels = assign_labels_other_platforms(matrix_path)
+            labels = assign_labels_other_platforms(matrix_path, gpl)
             all_labels.update(labels)
             print(f"  {gpl}: {len(labels)} MM")
         else:
             print(f"  WARNING: {matrix_path} not found")
 
     # Sort files
-    print(f"\n  Total labels: {Counter(all_labels.values())}")
+    label_counts = Counter(v[0] for v in all_labels.values())
+    print(f"\n  Total labels: {dict(label_counts)}")
     sort_files(all_labels)
 
-    # Save labels CSV
+    # Save labels CSV (now includes platform)
     csv_path = os.path.join(DATA_DIR, "sample_labels.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["sample_id", "label"])
-        for gsm, label in sorted(all_labels.items()):
+        writer.writerow(["sample_id", "label", "platform"])
+        for gsm, (label, platform) in sorted(all_labels.items()):
             if label != "excluded":
-                writer.writerow([gsm, label])
+                writer.writerow([gsm, label, platform])
     print(f"  Saved {csv_path}")
 
     # Summary
-    n_mgus = sum(1 for v in all_labels.values() if v == "MGUS")
-    n_mm = sum(1 for v in all_labels.values() if v == "MM")
-    n_exc = sum(1 for v in all_labels.values() if v == "excluded")
+    n_mgus = sum(1 for v in all_labels.values() if v[0] == "MGUS")
+    n_mm = sum(1 for v in all_labels.values() if v[0] == "MM")
+    n_exc = sum(1 for v in all_labels.values() if v[0] == "excluded")
     print(f"\n  TOTAL: {n_mgus} MGUS + {n_mm} MM = {n_mgus + n_mm} usable")
     print(f"  ({n_exc} excluded normals)")

@@ -13,6 +13,9 @@ import numpy as np
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 logging.getLogger("hmmlearn").setLevel(logging.ERROR)
@@ -20,6 +23,10 @@ logging.getLogger("hmmlearn").setLevel(logging.ERROR)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data", "GSE77975")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+QC_DIR = os.path.join(OUTPUT_DIR, "qc")
+PROBES_DIR = os.path.join(OUTPUT_DIR, "probes")
+
+DLRS_THRESHOLD = 0.3  # flag samples above this (report only, no exclusion)
 
 sys.path.insert(0, os.path.join(BASE_DIR, "pipeline"))
 import importlib
@@ -63,6 +70,54 @@ def clean_probes(rows_list):
     medians = df.groupby("sample_id")["LogRatio"].transform("median")
     df["LogRatio"] = df["LogRatio"] - medians
     return df
+
+
+def compute_dlrs(probe_df, platforms_dict):
+    """Derivative Log Ratio Spread: std of adjacent-probe log2R diffs / sqrt(2).
+
+    Standard aCGH noise metric. Values > 0.3 indicate noisy arrays.
+    Computed per sample across all chromosomes (probes sorted by chr, start).
+    """
+    rows = []
+    for sid, sdf in probe_df.groupby("sample_id"):
+        sdf = sdf.sort_values(["chr", "start"])
+        lr = sdf["LogRatio"].values
+        # restrict diff to within-chromosome pairs
+        chrs = sdf["chr"].values
+        diffs = np.diff(lr)
+        same_chrom = chrs[1:] == chrs[:-1]
+        diffs = diffs[same_chrom]
+        dlrs = float(np.std(diffs) / np.sqrt(2.0)) if len(diffs) > 0 else np.nan
+        rows.append({
+            "sample_id": sid,
+            "label": sdf["label"].iloc[0],
+            "platform": platforms_dict.get(sid, ""),
+            "n_probes": int(len(sdf)),
+            "dlrs": dlrs,
+        })
+    return pd.DataFrame(rows)
+
+
+def plot_dlrs(qc_df, out_path):
+    """DLRS histogram split by platform with threshold line."""
+    fig, ax = plt.subplots(figsize=(10, 5))
+    platforms = sorted(qc_df["platform"].unique())
+    colors = {"GPL11358": "steelblue", "GPL10152": "firebrick",
+              "GPL16237": "goldenrod", "GPL21461": "darkgreen"}
+    for p in platforms:
+        sub = qc_df[qc_df["platform"] == p]
+        ax.hist(sub["dlrs"].dropna(), bins=25, alpha=0.6,
+                label=f"{p} (n={len(sub)})",
+                color=colors.get(p, "gray"))
+    ax.axvline(DLRS_THRESHOLD, color="red", ls="--", lw=1,
+               label=f"DLRS={DLRS_THRESHOLD} threshold")
+    ax.set_xlabel("DLRS (Derivative Log Ratio Spread)")
+    ax.set_ylabel("Samples")
+    ax.set_title("Sample-level aCGH noise by platform")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
 
 
 def assign_arm(chrom, start):
@@ -186,9 +241,11 @@ if __name__ == "__main__":
     print("=" * 60, flush=True)
 
     labels_dict = {}
+    platforms_dict = {}
     with open(os.path.join(DATA_DIR, "sample_labels.csv")) as f:
         for row in csv.DictReader(f):
             labels_dict[row["sample_id"]] = row["label"]
+            platforms_dict[row["sample_id"]] = row.get("platform", "")
 
     # Parse
     file_list = []
@@ -216,6 +273,34 @@ if __name__ == "__main__":
     del all_rows; gc.collect()
     print(f"  After cleaning: {len(probe_df):,} rows, "
           f"{probe_df['sample_id'].nunique()} samples", flush=True)
+
+    # ===== DLRS QC =====
+    print(f"\n  Computing DLRS (aCGH noise metric)...", flush=True)
+    qc_df = compute_dlrs(probe_df, platforms_dict)
+    os.makedirs(QC_DIR, exist_ok=True)
+    qc_df.to_csv(os.path.join(QC_DIR, "sample_qc.csv"), index=False)
+    plot_dlrs(qc_df, os.path.join(QC_DIR, "dlrs_histogram.png"))
+    n_high = int((qc_df["dlrs"] > DLRS_THRESHOLD).sum())
+    print(f"  DLRS: median={qc_df['dlrs'].median():.3f}  "
+          f"max={qc_df['dlrs'].max():.3f}  "
+          f">{DLRS_THRESHOLD}: {n_high}/{len(qc_df)} samples (reported, not excluded)",
+          flush=True)
+    if n_high > 0:
+        flagged = qc_df[qc_df["dlrs"] > DLRS_THRESHOLD][
+            ["sample_id", "label", "platform", "dlrs"]]
+        print(flagged.to_string(index=False))
+
+    # Persist cleaned probes for fold-wise HMM retraining (used by 07_classify_foldwise.py)
+    os.makedirs(PROBES_DIR, exist_ok=True)
+    probes_path = os.path.join(PROBES_DIR, "probes_clean.parquet")
+    try:
+        probe_df.to_parquet(probes_path, index=False)
+        print(f"  Saved cleaned probes: {probes_path}", flush=True)
+    except Exception as e:
+        # Fallback to pickle if pyarrow not installed
+        probes_path = os.path.join(PROBES_DIR, "probes_clean.pkl")
+        probe_df.to_pickle(probes_path)
+        print(f"  (parquet unavailable: {e}) Saved as pickle: {probes_path}", flush=True)
 
     # Organize per-sample per-chromosome
     sample_chrom = {}
