@@ -217,7 +217,8 @@ if __name__ == "__main__":
 
     # Raw features: no leakage, compute once
     print("  Computing Raw features (once, no leakage)...", flush=True)
-    raw_feat = _proc.compute_raw_features(probe_df, labels_dict)
+    _, binned_df = _proc.build_binned_sample_chrom(probe_df)
+    raw_feat = _proc.compute_raw_features_from_bins(binned_df, labels_dict)
     raw_feat = raw_feat[raw_feat["label"].isin(["MGUS", "MM"])]
     sample_ids = list(raw_feat.index)
     y = (raw_feat["label"] == "MM").astype(int).values
