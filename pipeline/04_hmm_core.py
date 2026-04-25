@@ -10,7 +10,9 @@ import warnings
 import numpy as np
 from hmmlearn.hmm import GaussianHMM
 
-MIN_CNA_PROBES = 5
+# Minimum consecutive bins required to keep a CNA segment.
+# Since we will decode 1 Mb bins, 3 bins ~= 3 Mb minimum event size.
+MIN_CNA_BINS = 3
 
 # Defaults for 3-state (overridden by BIC selection)
 INIT_CONFIGS = {
@@ -237,8 +239,8 @@ def decode_sample(chrom_data, n_states, cohort_means, cohort_covars,
     return results
 
 
-def postprocess_states(states, neutral_state):
-    """Filter short CNA segments back to neutral."""
+def postprocess_states(states, neutral_state, min_bins=MIN_CNA_BINS):
+    """Filter short CNA segments back to neutral. States are assumed to come from fixed genomic bins, not raw probes. """
     states = states.copy()
     i = 0
     while i < len(states):
@@ -246,7 +248,7 @@ def postprocess_states(states, neutral_state):
             j = i
             while j < len(states) and states[j] == states[i]:
                 j += 1
-            if (j - i) < MIN_CNA_PROBES:
+            if (j - i) < min_bins:
                 states[i:j] = neutral_state
             i = j
         else:
