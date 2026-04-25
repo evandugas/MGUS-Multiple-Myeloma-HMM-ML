@@ -20,7 +20,9 @@ from sklearn.metrics import (roc_auc_score, average_precision_score, f1_score,
                              balanced_accuracy_score, roc_curve,
                              precision_recall_curve, confusion_matrix,
                              recall_score)
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.decomposition import PCA
+from scipy.cluster.hierarchy import linkage, leaves_list
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -63,6 +65,14 @@ def make_models():
             penalty="elasticnet", l1_ratio=0.5,
             class_weight="balanced", random_state=SEED),
     }
+
+
+def make_platform_covariates(meta_df):
+    """One-hot encode platform labels into numeric covariates."""
+    ohe = OneHotEncoder(sparse_output=False, drop=None, handle_unknown="ignore")
+    Z = ohe.fit_transform(meta_df[["platform"]])
+    names = [f"platform_{c}" for c in ohe.categories_[0]]
+    return Z, names
 
 
 def run_cv(X, y, feat_names, label):
@@ -113,6 +123,25 @@ def run_cv(X, y, feat_names, label):
               f"Sens={sens:.3f}  Spec={spec:.3f}")
         res[name]["mean_imp"] = np.mean(res[name]["imp"], axis=0)
     return res, rows
+
+
+def run_within_platform_cv(X, y, feat_names, platforms, target_platform, label):
+    """Run repeated CV only within one platform."""
+    mask = (platforms == target_platform)
+    Xp = X[mask]
+    yp = y[mask]
+
+    n_mgus = (yp == 0).sum()
+    n_mm = (yp == 1).sum()
+
+    print(f"\n  === Within-platform CV: {label} on {target_platform} ===")
+    print(f"  Samples: {len(yp)}  MGUS={n_mgus}  MM={n_mm}")
+
+    if len(np.unique(yp)) < 2:
+        print("  Skipping: only one class present.")
+        return None, []
+
+    return run_cv(Xp, yp, feat_names, f"{label}_{target_platform}")
 
 
 def region_tests(raw_df, raw_cols):
@@ -459,6 +488,57 @@ def stat_tests(results):
     pd.DataFrame(rows).to_csv(os.path.join(RESULTS_DIR, "statistical_tests.csv"), index=False)
 
 
+def plot_pca_by_platform_and_label(X, y, platforms, feature_set_name, out_prefix):
+    """Make PCA plots colored by platform and by label."""
+    # Standardize before PCA
+    sc = StandardScaler()
+    Xs = sc.fit_transform(X)
+
+    pca = PCA(n_components=2, random_state=SEED)
+    pcs = pca.fit_transform(Xs)
+
+    pca_df = pd.DataFrame({
+        "PC1": pcs[:, 0],
+        "PC2": pcs[:, 1],
+        "label": np.where(y == 1, "MM", "MGUS"),
+        "platform": platforms
+    })
+
+    # Plot 1: color by platform
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for plat in sorted(pca_df["platform"].unique()):
+        sub = pca_df[pca_df["platform"] == plat]
+        ax.scatter(sub["PC1"], sub["PC2"], s=45, alpha=0.8, label=plat)
+
+    ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}% var)")
+    ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}% var)")
+    ax.set_title(f"PCA of {feature_set_name} features (colored by platform)")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOT_DIR, f"{out_prefix}_pca_platform.png"), dpi=150)
+    plt.close()
+
+    # Plot 2: color by label
+    fig, ax = plt.subplots(figsize=(7, 6))
+    colors = {"MGUS": "steelblue", "MM": "firebrick"}
+    for lab in ["MGUS", "MM"]:
+        sub = pca_df[pca_df["label"] == lab]
+        ax.scatter(sub["PC1"], sub["PC2"], s=45, alpha=0.8, label=lab, color=colors[lab])
+
+    ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}% var)")
+    ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}% var)")
+    ax.set_title(f"PCA of {feature_set_name} features (colored by label)")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOT_DIR, f"{out_prefix}_pca_label.png"), dpi=150)
+    plt.close()
+
+    # Save coordinates
+    pca_df.to_csv(os.path.join(RESULTS_DIR, f"{out_prefix}_pca_coordinates.csv"), index=False)
+
+    return pca_df
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  Classification: HMM vs Raw")
@@ -483,6 +563,19 @@ if __name__ == "__main__":
     X_hmm = hmm_df[hmm_cols].fillna(0).values
     X_raw = raw_df[raw_cols].fillna(0).values
 
+    meta_df = pd.read_csv(labels_csv)
+    meta_df = meta_df[meta_df["label"].isin(["MGUS", "MM"])].copy()
+    meta_df = meta_df.set_index("sample_id").loc[hmm_df.index]
+    platform_array = meta_df["platform"].values
+
+    Z_platform, platform_cols = make_platform_covariates(meta_df)
+
+    X_hmm_cov = np.hstack([X_hmm, Z_platform])
+    X_raw_cov = np.hstack([X_raw, Z_platform])
+
+    hmm_cols_cov = hmm_cols + platform_cols
+    raw_cols_cov = raw_cols + platform_cols
+
     # HMM-80: matched feature count with Raw (del + amp fractions only, 40 arms x 2 = 80)
     hmm80_cols = [c for c in hmm_cols
                    if c.startswith("del_") or c.startswith("amp_")]
@@ -502,7 +595,10 @@ if __name__ == "__main__":
     all_rows = []
     for name, X, cols in [("HMM", X_hmm, hmm_cols),
                            ("HMM80", X_hmm80, hmm80_cols),
-                           ("Raw", X_raw, raw_cols)]:
+                           ("Raw", X_raw, raw_cols),
+                           ("HMM+Platform", X_hmm_cov, hmm_cols_cov),
+                           ("Raw+Platform", X_raw_cov, raw_cols_cov),
+                        ]:
         print(f"\nRunning CV: {name} ({X.shape[1]} features)...")
         res, rows = run_cv(X, y, cols, name)
         results[name] = res
@@ -662,6 +758,13 @@ if __name__ == "__main__":
     ax2.set_xticks(xa); ax2.set_xticklabels(arms_p, rotation=90, fontsize=7)
     plt.tight_layout(); plt.savefig(os.path.join(PLOT_DIR, "07_arm_comparison.png"), dpi=150,
                                      bbox_inches="tight"); plt.close()
+
+    # 8-11: PCA diagnostics
+    print("\nGenerating PCA diagnostics...")
+    plot_pca_by_platform_and_label(X_hmm, y, platform_array, "HMM", "08_hmm")
+    plot_pca_by_platform_and_label(X_raw, y, platform_array, "Raw", "09_raw")
+    plot_pca_by_platform_and_label(X_hmm_cov, y, platform_array, "HMM+Platform", "10_hmm_cov")
+    plot_pca_by_platform_and_label(X_raw_cov, y, platform_array, "Raw+Platform", "11_raw_cov")
 
     print(f"\nPlots: {PLOT_DIR}")
     print(f"Results: {RESULTS_DIR}")
