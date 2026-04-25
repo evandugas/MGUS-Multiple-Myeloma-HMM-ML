@@ -30,6 +30,7 @@ DLRS_THRESHOLD = 0.3  # flag samples above this (report only, no exclusion)
 
 sys.path.insert(0, os.path.join(BASE_DIR, "pipeline"))
 import importlib
+_bins = importlib.import_module("02_genomic_bins")
 _parsers = importlib.import_module("03_parsers")
 _hmm = importlib.import_module("04_hmm_core")
 
@@ -124,8 +125,42 @@ def assign_arm(chrom, start):
     return "p" if start < CENTROMERES.get(chrom, 0) else "q"
 
 
+def build_binned_sample_chrom(probe_df):
+    """Convert cleaned probe-level data into shared 1 Mb genomic bins."""
+    rows = []
+    sample_chrom = {}
+
+    for sid, sdf in probe_df.groupby("sample_id"):
+        label = sdf["label"].iloc[0]
+
+        bin_values = _bins.compute_bin_values(sdf[["chr", "start", "LogRatio"]])
+        chrom_arrays = _bins.binned_to_chrom_arrays(bin_values)
+
+        chrom_dict = {}
+        for chrom, (vals, midpoints, bin_idx) in chrom_arrays.items():
+            chrom_dict[chrom] = (vals, midpoints)
+
+            arm_ids = np.where(
+                midpoints < CENTROMERES[chrom],
+                chrom + "p",
+                chrom + "q"
+            )
+
+            for v, pos, arm in zip(vals, midpoints, arm_ids):
+                rows.append((sid, label, chrom, int(pos), arm, float(v)))
+
+        sample_chrom[sid] = chrom_dict
+
+    sample_bin_df = pd.DataFrame(
+        rows,
+        columns=["sample_id", "label", "chr", "start", "arm_id", "bin_value"]
+    )
+
+    return sample_chrom, sample_bin_df
+
+
 def compute_hmm_features(probe_states_df, labels_dict):
-    """Arm-level CNA features from Viterbi states."""
+    """Arm-level CNA features from Viterbi-decoded genomic bins."""
     df = probe_states_df.copy()
     df["arm_id"] = df.apply(lambda r: r["chr"] + assign_arm(r["chr"], r["start"]), axis=1)
 
@@ -185,18 +220,7 @@ def compute_hmm_features(probe_states_df, labels_dict):
 
     samples = result.index
 
-    # Normalize segment counts by probe count per sample
-    # (removes platform density confound: 60K arrays produce more segments than 1M)
-    sample_probe_counts = df.groupby("sample_id").size()
-    for s in samples:
-        n_probes = sample_probe_counts.get(s, 1)
-        # Segments per 10K probes — comparable across platforms
-        scale = 10000.0 / n_probes
-        seg[s]["n_seg"] *= scale
-        seg[s]["n_del_seg"] *= scale
-        seg[s]["n_amp_seg"] *= scale
-        for arm in arm_seg_count[s]:
-            arm_seg_count[s][arm] *= scale
+    # No per-sample probe-density normalization needed here because segmentation is now performed on shared fixed-width genomic bins.
 
     result["n_segments"] = [seg[s]["n_seg"] for s in samples]
     result["n_del_segments"] = [seg[s]["n_del_seg"] for s in samples]
@@ -217,16 +241,17 @@ def compute_hmm_features(probe_states_df, labels_dict):
     return result
 
 
-def compute_raw_features(probe_df, labels_dict):
-    """Mean + SD of raw log2R per arm from probe data."""
-    df = probe_df[["sample_id", "chr", "start", "LogRatio"]].copy()
-    df["arm_id"] = df.apply(lambda r: r["chr"] + assign_arm(r["chr"], r["start"]), axis=1)
+def compute_raw_features_from_bins(binned_df, labels_dict):
+    """Mean + SD of raw binned log2 ratio per arm from shared 1 Mb bins."""
+    grp = binned_df.groupby(["sample_id", "arm_id"])["bin_value"]
 
-    grp = df.groupby(["sample_id", "arm_id"])["LogRatio"]
     mean_piv = grp.mean().reset_index(name="v").pivot_table(
-        index="sample_id", columns="arm_id", values="v", fill_value=0)
+        index="sample_id", columns="arm_id", values="v", fill_value=0
+    )
     sd_piv = grp.std().fillna(0).reset_index(name="v").pivot_table(
-        index="sample_id", columns="arm_id", values="v", fill_value=0)
+        index="sample_id", columns="arm_id", values="v", fill_value=0
+    )
+
     mean_piv.columns = [f"mean_{c}" for c in mean_piv.columns]
     sd_piv.columns = [f"sd_{c}" for c in sd_piv.columns]
 
@@ -302,21 +327,15 @@ if __name__ == "__main__":
         probe_df.to_pickle(probes_path)
         print(f"  (parquet unavailable: {e}) Saved as pickle: {probes_path}", flush=True)
 
-    # Organize per-sample per-chromosome
-    sample_chrom = {}
+    print("\n  Converting probes to shared 1 Mb genomic bins...", flush=True)
+    sample_chrom, binned_df = build_binned_sample_chrom(probe_df)
+
     all_seqs = []
-    for sid, sdf in probe_df.groupby("sample_id"):
-        cd = {}
-        for chrom in CHROMOSOMES:
-            mask = sdf["chr"] == chrom
-            if mask.sum() < 20:
-                continue
-            cdf = sdf[mask].sort_values("start")
-            lr = cdf["LogRatio"].values
-            starts = cdf["start"].values
-            cd[chrom] = (lr, starts)
-            all_seqs.append(lr)
-        sample_chrom[sid] = cd
+    for sid, chrom_dict in sample_chrom.items():
+        for chrom, (vals, starts) in chrom_dict.items():
+            if len(vals) >= 5:
+                all_seqs.append(vals)
+
 
     # Stage 0: BIC model selection
     print(f"\n  Stage 0: BIC model selection...", flush=True)
@@ -350,7 +369,7 @@ if __name__ == "__main__":
     print(f"\n  Computing features...", flush=True)
     hmm_feat = compute_hmm_features(states_df, labels_dict)
     del states_df; gc.collect()
-    raw_feat = compute_raw_features(probe_df, labels_dict)
+    raw_feat = compute_raw_features_from_bins(binned_df, labels_dict)
     del probe_df; gc.collect()
 
     # Save
