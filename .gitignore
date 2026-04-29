@@ -1,0 +1,48 @@
+# Data (large, downloaded from GEO)
+data/
+*.tar
+
+# Generated outputs (large CSV files)
+output/features/*.csv
+output/results/*.csv
+
+# R (legacy)
+.Rhistory
+.Rdata
+.RData
+.Rproj.user/
+*.Rproj
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+
+# Nextflow (not used)
+.nextflow/
+.nextflow.log*
+work/
+nextflow
+nextflow.config
+main.nf
+
+# Other
+*.rds
+*.pkl
+*.joblib
+.claude/

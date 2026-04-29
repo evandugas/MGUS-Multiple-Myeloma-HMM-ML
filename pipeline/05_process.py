@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Data processing pipeline for GSE77975.
+
+  1. Parse raw Agilent files
+  2. Clean probes (filter errors, median-center)
+  3. Stage 1: Train cohort-wide 3-state HMM
+  4. Stage 2: Per-sample Viterbi decoding
+  5. Extract arm-level features (HMM + Raw)
+"""
+
+import os, sys, gc, warnings, csv, logging
+import numpy as np
+import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import defaultdict
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+logging.getLogger("hmmlearn").setLevel(logging.ERROR)
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, "data", "GSE77975")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+QC_DIR = os.path.join(OUTPUT_DIR, "qc")
+PROBES_DIR = os.path.join(OUTPUT_DIR, "probes")
+
+DLRS_THRESHOLD = 0.3  # flag samples above this (report only, no exclusion)
+
+sys.path.insert(0, os.path.join(BASE_DIR, "pipeline"))
+import importlib
+_bins = importlib.import_module("02_genomic_bins")
+_parsers = importlib.import_module("03_parsers")
+_hmm = importlib.import_module("04_hmm_core")
+
+CHROMOSOMES = [f"chr{i}" for i in range(1, 23)]
+CENTROMERES = {
+    "chr1": 125_000_000, "chr2": 93_300_000, "chr3": 91_000_000,
+    "chr4": 50_400_000, "chr5": 48_400_000, "chr6": 61_000_000,
+    "chr7": 59_900_000, "chr8": 45_600_000, "chr9": 49_000_000,
+    "chr10": 40_200_000, "chr11": 53_700_000, "chr12": 35_800_000,
+    "chr13": 17_900_000, "chr14": 17_600_000, "chr15": 19_000_000,
+    "chr16": 36_600_000, "chr17": 22_200_000, "chr18": 18_200_000,
+    "chr19": 26_500_000, "chr20": 27_500_000, "chr21": 13_200_000,
+    "chr22": 14_700_000,
+}
+
+N_WORKERS = min(8, os.cpu_count() or 4)
+
+
+def _parse_one_file(args):
+    filepath, gsm_id, label = args
+    warnings.filterwarnings("ignore")
+    return gsm_id, _parsers.parse_agilent_file(filepath, gsm_id, label)
+
+
+def _decode_one_sample(args):
+    sample_id, chrom_data, n_states, means, covars, transmat = args
+    warnings.filterwarnings("ignore")
+    logging.getLogger("hmmlearn").setLevel(logging.ERROR)
+    return _hmm.decode_sample(chrom_data, n_states, means, covars, transmat, sample_id)
+
+
+def clean_probes(rows_list):
+    df = pd.DataFrame(rows_list,
+                      columns=["sample_id", "label", "chr", "start", "end",
+                               "LogRatio", "LogRatioError"])
+    if df["LogRatioError"].max() > 0:
+        df = df[df["LogRatioError"] <= df["LogRatioError"].quantile(0.99)]
+    medians = df.groupby("sample_id")["LogRatio"].transform("median")
+    df["LogRatio"] = df["LogRatio"] - medians
+    return df
+
+
+def compute_dlrs(probe_df, platforms_dict):
+    """Derivative Log Ratio Spread: std of adjacent-probe log2R diffs / sqrt(2).
+
+    Standard aCGH noise metric. Values > 0.3 indicate noisy arrays.
+    Computed per sample across all chromosomes (probes sorted by chr, start).
+    """
+    rows = []
+    for sid, sdf in probe_df.groupby("sample_id"):
+        sdf = sdf.sort_values(["chr", "start"])
+        lr = sdf["LogRatio"].values
+        # restrict diff to within-chromosome pairs
+        chrs = sdf["chr"].values
+        diffs = np.diff(lr)
+        same_chrom = chrs[1:] == chrs[:-1]
+        diffs = diffs[same_chrom]
+        dlrs = float(np.std(diffs) / np.sqrt(2.0)) if len(diffs) > 0 else np.nan
+        rows.append({
+            "sample_id": sid,
+            "label": sdf["label"].iloc[0],
+            "platform": platforms_dict.get(sid, ""),
+            "n_probes": int(len(sdf)),
+            "dlrs": dlrs,
+        })
+    return pd.DataFrame(rows)
+
+
+def plot_dlrs(qc_df, out_path):
+    """DLRS histogram split by platform with threshold line."""
+    fig, ax = plt.subplots(figsize=(10, 5))
+    platforms = sorted(qc_df["platform"].unique())
+    colors = {"GPL11358": "steelblue", "GPL10152": "firebrick",
+              "GPL16237": "goldenrod", "GPL21461": "darkgreen"}
+    for p in platforms:
+        sub = qc_df[qc_df["platform"] == p]
+        ax.hist(sub["dlrs"].dropna(), bins=25, alpha=0.6,
+                label=f"{p} (n={len(sub)})",
+                color=colors.get(p, "gray"))
+    ax.axvline(DLRS_THRESHOLD, color="red", ls="--", lw=1,
+               label=f"DLRS={DLRS_THRESHOLD} threshold")
+    ax.set_xlabel("DLRS (Derivative Log Ratio Spread)")
+    ax.set_ylabel("Samples")
+    ax.set_title("Sample-level aCGH noise by platform")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+
+def assign_arm(chrom, start):
+    return "p" if start < CENTROMERES.get(chrom, 0) else "q"
+
+
+def build_binned_sample_chrom(probe_df):
+    """Convert cleaned probe-level data into shared 1 Mb genomic bins."""
+    rows = []
+    sample_chrom = {}
+
+    for sid, sdf in probe_df.groupby("sample_id"):
+        label = sdf["label"].iloc[0]
+
+        bin_values = _bins.compute_bin_values(sdf[["chr", "start", "LogRatio"]])
+        chrom_arrays = _bins.binned_to_chrom_arrays(bin_values)
+
+        chrom_dict = {}
+        for chrom, (vals, midpoints, bin_idx) in chrom_arrays.items():
+            chrom_dict[chrom] = (vals, midpoints)
+
+            arm_ids = np.where(
+                midpoints < CENTROMERES[chrom],
+                chrom + "p",
+                chrom + "q"
+            )
+
+            for v, pos, arm in zip(vals, midpoints, arm_ids):
+                rows.append((sid, label, chrom, int(pos), arm, float(v)))
+
+        sample_chrom[sid] = chrom_dict
+
+    sample_bin_df = pd.DataFrame(
+        rows,
+        columns=["sample_id", "label", "chr", "start", "arm_id", "bin_value"]
+    )
+
+    return sample_chrom, sample_bin_df
+
+
+def compute_hmm_features(probe_states_df, labels_dict):
+    """Arm-level CNA features from Viterbi-decoded genomic bins."""
+    df = probe_states_df.copy()
+    df["arm_id"] = df.apply(lambda r: r["chr"] + assign_arm(r["chr"], r["start"]), axis=1)
+
+    # Del/amp fractions per arm
+    total = df.groupby(["sample_id", "arm_id"]).size().reset_index(name="n")
+    n_del = df[df["state"] == 0].groupby(["sample_id", "arm_id"]).size().reset_index(name="n_del")
+    n_amp = df[df["state"] == 2].groupby(["sample_id", "arm_id"]).size().reset_index(name="n_amp")
+
+    feat = total.merge(n_del, on=["sample_id", "arm_id"], how="left")
+    feat = feat.merge(n_amp, on=["sample_id", "arm_id"], how="left")
+    feat["n_del"] = feat["n_del"].fillna(0)
+    feat["n_amp"] = feat["n_amp"].fillna(0)
+    feat["frac_del"] = feat["n_del"] / feat["n"]
+    feat["frac_amp"] = feat["n_amp"] / feat["n"]
+
+    del_piv = feat.pivot_table(index="sample_id", columns="arm_id", values="frac_del", fill_value=0)
+    amp_piv = feat.pivot_table(index="sample_id", columns="arm_id", values="frac_amp", fill_value=0)
+    del_piv.columns = [f"del_{c}" for c in del_piv.columns]
+    amp_piv.columns = [f"amp_{c}" for c in amp_piv.columns]
+    result = pd.concat([del_piv, amp_piv], axis=1)
+
+    # CNA burden
+    sample_n = df.groupby("sample_id").size()
+    sample_cna = df[df["state"] != 1].groupby("sample_id").size()
+    result["cna_burden"] = result.index.map((sample_cna / sample_n).fillna(0)).fillna(0)
+
+    # Segment counts + means
+    seg = defaultdict(lambda: {"n_seg": 0, "n_del_seg": 0, "n_amp_seg": 0})
+    arm_seg_count = defaultdict(lambda: defaultdict(int))
+    arm_seg_mean_del = defaultdict(lambda: defaultdict(list))
+    arm_seg_mean_amp = defaultdict(lambda: defaultdict(list))
+
+    for (sid, chrom), grp in df.groupby(["sample_id", "chr"]):
+        grp = grp.sort_values("start")
+        states = grp["state"].values
+        lr = grp["log_ratio"].values
+        arms = grp["arm_id"].values
+        i = 0
+        while i < len(states):
+            if states[i] != 1:
+                j = i
+                while j < len(states) and states[j] == states[i]:
+                    j += 1
+                seg[sid]["n_seg"] += 1
+                a = arms[i]
+                if states[i] == 0:
+                    seg[sid]["n_del_seg"] += 1
+                    arm_seg_count[sid][a] += 1
+                    arm_seg_mean_del[sid][a].append(float(np.mean(lr[i:j])))
+                else:
+                    seg[sid]["n_amp_seg"] += 1
+                    arm_seg_count[sid][a] += 1
+                    arm_seg_mean_amp[sid][a].append(float(np.mean(lr[i:j])))
+                i = j
+            else:
+                i += 1
+
+    samples = result.index
+
+    # No per-sample probe-density normalization needed here because segmentation is now performed on shared fixed-width genomic bins.
+
+    result["n_segments"] = [seg[s]["n_seg"] for s in samples]
+    result["n_del_segments"] = [seg[s]["n_del_seg"] for s in samples]
+    result["n_amp_segments"] = [seg[s]["n_amp_seg"] for s in samples]
+
+    all_arms = sorted(set(df["arm_id"]))
+    for arm in all_arms:
+        result[f"seg_count_{arm}"] = [arm_seg_count[s].get(arm, 0) for s in samples]
+    for arm in all_arms:
+        result[f"seg_mean_del_{arm}"] = [
+            float(np.mean(arm_seg_mean_del[s][arm])) if arm_seg_mean_del[s].get(arm) else 0.0
+            for s in samples]
+        result[f"seg_mean_amp_{arm}"] = [
+            float(np.mean(arm_seg_mean_amp[s][arm])) if arm_seg_mean_amp[s].get(arm) else 0.0
+            for s in samples]
+
+    result.insert(0, "label", result.index.map(labels_dict))
+    return result
+
+
+def compute_raw_features_from_bins(binned_df, labels_dict):
+    """Mean + SD of raw binned log2 ratio per arm from shared 1 Mb bins."""
+    grp = binned_df.groupby(["sample_id", "arm_id"])["bin_value"]
+
+    mean_piv = grp.mean().reset_index(name="v").pivot_table(
+        index="sample_id", columns="arm_id", values="v", fill_value=0
+    )
+    sd_piv = grp.std().fillna(0).reset_index(name="v").pivot_table(
+        index="sample_id", columns="arm_id", values="v", fill_value=0
+    )
+
+    mean_piv.columns = [f"mean_{c}" for c in mean_piv.columns]
+    sd_piv.columns = [f"sd_{c}" for c in sd_piv.columns]
+
+    result = pd.concat([mean_piv, sd_piv], axis=1)
+    result.insert(0, "label", result.index.map(labels_dict))
+    return result
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  Pipeline: GSE77975 — Cohort-trained HMM (BIC selection)")
+    print("=" * 60, flush=True)
+
+    labels_dict = {}
+    platforms_dict = {}
+    with open(os.path.join(DATA_DIR, "sample_labels.csv")) as f:
+        for row in csv.DictReader(f):
+            labels_dict[row["sample_id"]] = row["label"]
+            platforms_dict[row["sample_id"]] = row.get("platform", "")
+
+    # Parse
+    file_list = []
+    for subdir, label in [("mgus", "MGUS"), ("mm", "MM")]:
+        d = os.path.join(DATA_DIR, "raw", subdir)
+        if not os.path.exists(d):
+            continue
+        files = sorted(f for f in os.listdir(d) if f.endswith(".gz"))
+        print(f"  {subdir}/: {len(files)} files", flush=True)
+        for fn in files:
+            gsm = fn.split("_")[0].split(".")[0]
+            file_list.append((os.path.join(d, fn), gsm, label))
+
+    print(f"\n  Parsing {len(file_list)} files...", flush=True)
+    all_rows = []
+    with ProcessPoolExecutor(max_workers=N_WORKERS) as ex:
+        for future in as_completed({ex.submit(_parse_one_file, a): a[1] for a in file_list}):
+            gsm, rows = future.result()
+            if rows:
+                all_rows.extend(rows)
+    print(f"  {len(all_rows):,} probe rows", flush=True)
+
+    # Clean
+    probe_df = clean_probes(all_rows)
+    del all_rows; gc.collect()
+    print(f"  After cleaning: {len(probe_df):,} rows, "
+          f"{probe_df['sample_id'].nunique()} samples", flush=True)
+
+    # ===== DLRS QC =====
+    print(f"\n  Computing DLRS (aCGH noise metric)...", flush=True)
+    qc_df = compute_dlrs(probe_df, platforms_dict)
+    os.makedirs(QC_DIR, exist_ok=True)
+    qc_df.to_csv(os.path.join(QC_DIR, "sample_qc.csv"), index=False)
+    plot_dlrs(qc_df, os.path.join(QC_DIR, "dlrs_histogram.png"))
+    n_high = int((qc_df["dlrs"] > DLRS_THRESHOLD).sum())
+    print(f"  DLRS: median={qc_df['dlrs'].median():.3f}  "
+          f"max={qc_df['dlrs'].max():.3f}  "
+          f">{DLRS_THRESHOLD}: {n_high}/{len(qc_df)} samples (reported, not excluded)",
+          flush=True)
+    if n_high > 0:
+        flagged = qc_df[qc_df["dlrs"] > DLRS_THRESHOLD][
+            ["sample_id", "label", "platform", "dlrs"]]
+        print(flagged.to_string(index=False))
+
+    # Persist cleaned probes for fold-wise HMM retraining (used by 07_classify_foldwise.py)
+    os.makedirs(PROBES_DIR, exist_ok=True)
+    probes_path = os.path.join(PROBES_DIR, "probes_clean.parquet")
+    try:
+        probe_df.to_parquet(probes_path, index=False)
+        print(f"  Saved cleaned probes: {probes_path}", flush=True)
+    except Exception as e:
+        # Fallback to pickle if pyarrow not installed
+        probes_path = os.path.join(PROBES_DIR, "probes_clean.pkl")
+        probe_df.to_pickle(probes_path)
+        print(f"  (parquet unavailable: {e}) Saved as pickle: {probes_path}", flush=True)
+
+    print("\n  Converting probes to shared 1 Mb genomic bins...", flush=True)
+    sample_chrom, binned_df = build_binned_sample_chrom(probe_df)
+
+    all_seqs = []
+    for sid, chrom_dict in sample_chrom.items():
+        for chrom, (vals, starts) in chrom_dict.items():
+            if len(vals) >= 5:
+                all_seqs.append(vals)
+
+
+    # Stage 0: BIC model selection
+    print(f"\n  Stage 0: BIC model selection...", flush=True)
+    n_states = _hmm.select_n_states(all_seqs)
+
+    # Stage 1: Cohort training
+    print(f"\n  Stage 1: Cohort HMM training...", flush=True)
+    n_states, means, covars, transmat = _hmm.train_cohort_model(all_seqs, n_states)
+    del all_seqs; gc.collect()
+
+    # Stage 2: Per-sample decoding
+    print(f"\n  Stage 2: Decoding {len(sample_chrom)} samples...", flush=True)
+    args = [(sid, cd, n_states, means, covars, transmat) for sid, cd in sample_chrom.items()]
+    all_states = []
+    n_done = 0
+    with ProcessPoolExecutor(max_workers=N_WORKERS) as ex:
+        futs = {ex.submit(_decode_one_sample, a): a[0] for a in args}
+        for f in as_completed(futs):
+            all_states.extend(f.result())
+            n_done += 1
+            if n_done % 20 == 0:
+                print(f"    {n_done}/{len(sample_chrom)} done", flush=True)
+    del args, sample_chrom; gc.collect()
+    print(f"  {len(all_states):,} probe states", flush=True)
+
+    states_df = pd.DataFrame(all_states,
+                             columns=["sample_id", "chr", "start", "log_ratio", "state"])
+    del all_states; gc.collect()
+
+    # Features
+    print(f"\n  Computing features...", flush=True)
+    hmm_feat = compute_hmm_features(states_df, labels_dict)
+    del states_df; gc.collect()
+    raw_feat = compute_raw_features_from_bins(binned_df, labels_dict)
+    del probe_df; gc.collect()
+
+    # Save
+    feat_dir = os.path.join(OUTPUT_DIR, "features")
+    os.makedirs(feat_dir, exist_ok=True)
+    hmm_feat.to_csv(os.path.join(feat_dir, "feature_matrix_hmm.csv"))
+    raw_feat.to_csv(os.path.join(feat_dir, "feature_matrix_raw.csv"))
+
+    n_mgus = (hmm_feat["label"] == "MGUS").sum()
+    n_mm = (hmm_feat["label"] == "MM").sum()
+    print(f"\n  {n_mgus} MGUS + {n_mm} MM = {len(hmm_feat)} samples")
+    print(f"  HMM features: {hmm_feat.shape[1] - 1}")
+    print(f"  Raw features: {raw_feat.shape[1] - 1}")
+    print("  Done.", flush=True)
